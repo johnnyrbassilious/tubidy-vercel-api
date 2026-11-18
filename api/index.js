@@ -1,5 +1,4 @@
 const yts = require('yt-search');
-const ytdl = require('@distube/ytdl-core');
 
 function extractYouTubeId(inputUrl) {
   if (!inputUrl) return null;
@@ -7,7 +6,7 @@ function extractYouTubeId(inputUrl) {
   return match ? match[1] : (/^[a-zA-Z0-9_-]{11}$/.test(inputUrl) ? inputUrl : null);
 }
 
-async function fetchTimeout(url, options = {}, ms = 4500) {
+async function fetchTimeout(url, options = {}, ms = 5000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
@@ -17,94 +16,149 @@ async function fetchTimeout(url, options = {}, ms = 4500) {
   }
 }
 
-// Fast parallel resolver across InnerTube, Invidious, Piped, and ytdl
+// 1. Direct InnerTube Android_VR / TV_Embedded Resolver (Bypasses Web Bot Checks)
+async function resolveViaInnerTube(videoId, mode = 'video', quality = '720') {
+  const qNum = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
+  const clients = [
+    {
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      userAgent: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      osName: 'Android',
+      osVersion: '12L',
+      androidSdkVersion: 32
+    },
+    {
+      clientName: 'IOS',
+      clientVersion: '19.45.4',
+      userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X;)',
+      osName: 'iOS',
+      osVersion: '18.1.0.22B83',
+      deviceMake: 'Apple',
+      deviceModel: 'iPhone16,2'
+    }
+  ];
+
+  for (const c of clients) {
+    try {
+      const res = await fetchTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': c.userAgent,
+          'X-YouTube-Client-Name': c.clientName === 'IOS' ? '5' : '28',
+          'X-YouTube-Client-Version': c.clientVersion
+        },
+        body: JSON.stringify({
+          videoId,
+          context: {
+            client: {
+              clientName: c.clientName,
+              clientVersion: c.clientVersion,
+              osName: c.osName,
+              osVersion: c.osVersion,
+              ...(c.androidSdkVersion ? { androidSdkVersion: c.androidSdkVersion } : {}),
+              ...(c.deviceMake ? { deviceMake: c.deviceMake, deviceModel: c.deviceModel } : {}),
+              hl: 'en',
+              gl: 'US'
+            }
+          },
+          contentCheckOk: true,
+          racyCheckOk: true
+        })
+      }, 4000);
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      const streamingData = data.streamingData;
+      if (!streamingData) continue;
+
+      const formats = [...(streamingData.formats || []), ...(streamingData.adaptiveFormats || [])].filter(f => f && f.url);
+      if (formats.length === 0) continue;
+
+      if (mode === 'audio') {
+        const audios = formats
+          .filter(f => (f.mimeType || '').startsWith('audio/'))
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        if (audios.length > 0) {
+          return { url: audios[0].url, mime: (audios[0].mimeType || 'audio/mp4').split(';')[0] };
+        }
+      }
+
+      const muxed = (streamingData.formats || []).filter(f => f && f.url);
+      if (muxed.length > 0) {
+        const matched = muxed.find(f => f.height === qNum || (f.qualityLabel || '').includes(String(qNum))) || muxed[muxed.length - 1];
+        return { url: matched.url, mime: 'video/mp4' };
+      }
+
+      if (streamingData.hlsManifestUrl) {
+        return { url: streamingData.hlsManifestUrl, mime: 'application/vnd.apple.mpegurl' };
+      }
+    } catch (_) {}
+  }
+  throw new Error('InnerTube unavailable');
+}
+
+// 2. Parallel Multi-Provider Resolver (InnerTube + Active Piped + Invidious + Cobalt)
 async function resolveWorkingMedia(targetUrl, mode = 'video', quality = '720') {
   const videoId = extractYouTubeId(targetUrl);
   const qNum = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
-
-  const resolvers = [];
+  const tasks = [];
 
   if (videoId) {
-    // 1. Invidious Public API Nodes (Fast, provides proxied local streams that bypass IP locks)
-    const invidiousNodes = [
-      'https://inv.nadeko.net',
-      'https://invidious.nerdvpn.de',
-      'https://invidious.jing.rocks',
-      'https://iv.datura.network'
-    ];
+    tasks.push(resolveViaInnerTube(videoId, mode, quality));
 
-    for (const node of invidiousNodes) {
-      resolvers.push((async () => {
-        const res = await fetchTimeout(`${node}/api/v1/videos/${videoId}`, {}, 4000);
-        if (!res.ok) throw new Error('Invidious status ' + res.status);
-        const data = await res.json();
-
-        if (mode === 'audio' && Array.isArray(data.adaptiveFormats)) {
-          const audios = data.adaptiveFormats
-            .filter(f => (f.type || '').startsWith('audio/'))
-            .sort((a, b) => (parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0)));
-          if (audios.length > 0 && audios[0].url) {
-            return { url: `${node}/latest_version?id=${videoId}&itag=${audios[0].itag}&local=true`, mime: 'audio/mp4' };
-          }
-        }
-
-        if (Array.isArray(data.formatStreams) && data.formatStreams.length > 0) {
-          const matched = data.formatStreams.find(f => (f.qualityLabel || '').includes(String(qNum))) || data.formatStreams[0];
-          if (matched) {
-            return { url: `${node}/latest_version?id=${videoId}&itag=${matched.itag || 18}&local=true`, mime: 'video/mp4' };
-          }
-        }
-        throw new Error('No formats in Invidious');
-      })());
-    }
-
-    // 2. Piped Active API Nodes
     const pipedNodes = [
       'https://pipedapi.kavin.rocks',
       'https://pipedapi.adminforge.de',
+      'https://pipedapi.drgns.space',
       'https://api.piped.private.coffee'
     ];
-
     for (const node of pipedNodes) {
-      resolvers.push((async () => {
+      tasks.push((async () => {
         const res = await fetchTimeout(`${node}/streams/${videoId}`, {}, 4000);
-        if (!res.ok) throw new Error('Piped failed');
+        if (!res.ok) throw new Error('Piped bad status');
         const data = await res.json();
         if (mode === 'audio' && Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
           const best = data.audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
           if (best && best.url) return { url: best.url, mime: best.mimeType || 'audio/mp4' };
         }
-        if (Array.isArray(data.videoStreams) && data.videoStreams.length > 0) {
-          const progressive = data.videoStreams.filter(s => s.videoOnly === false);
-          const list = progressive.length > 0 ? progressive : data.videoStreams;
-          const match = list.find(s => (s.quality || '').includes(String(qNum))) || list[0];
-          if (match && match.url) return { url: match.url, mime: 'video/mp4' };
-        }
+        const videos = (data.videoStreams || []).filter(v => v.videoOnly === false);
+        const pool = videos.length > 0 ? videos : (data.videoStreams || []);
+        const match = pool.find(v => (v.quality || '').includes(String(qNum))) || pool[0];
+        if (match && match.url) return { url: match.url, mime: 'video/mp4' };
         throw new Error('No Piped stream');
       })());
     }
 
-    // 3. @distube/ytdl-core fallback
-    resolvers.push((async () => {
-      const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
-      if (mode === 'audio') {
-        const fmt = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
-        if (fmt && fmt.url) return { url: fmt.url, mime: 'audio/mp4' };
-      }
-      const progressive = info.formats.filter(f => f.hasVideo && f.hasAudio);
-      const fmt = progressive.find(f => f.height === qNum) || progressive[0] || ytdl.chooseFormat(info.formats, { quality: 'highest' });
-      if (fmt && fmt.url) return { url: fmt.url, mime: 'video/mp4' };
-      throw new Error('No ytdl format');
-    })());
+    const invNodes = [
+      'https://inv.nadeko.net',
+      'https://invidious.nerdvpn.de',
+      'https://iv.datura.network'
+    ];
+    for (const node of invNodes) {
+      tasks.push((async () => {
+        const res = await fetchTimeout(`${node}/api/v1/videos/${videoId}`, {}, 4000);
+        if (!res.ok) throw new Error('Inv failed');
+        const data = await res.json();
+        if (mode === 'audio' && Array.isArray(data.adaptiveFormats)) {
+          const aud = data.adaptiveFormats.filter(f => (f.type || '').startsWith('audio/')).sort((a, b) => (parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0)))[0];
+          if (aud && aud.itag) return { url: `${node}/latest_version?id=${videoId}&itag=${aud.itag}&local=true`, mime: 'audio/mp4' };
+        }
+        const fmt = (data.formatStreams || [])[0];
+        if (fmt && fmt.itag) return { url: `${node}/latest_version?id=${videoId}&itag=${fmt.itag}&local=true`, mime: 'video/mp4' };
+        throw new Error('No Inv format');
+      })());
+    }
   }
 
-  // 4. Multi-platform resolver (TikTok, SoundCloud, Instagram, X, YouTube)
   const cobaltNodes = [
     'https://cobalt-backend.canine.tools',
-    'https://cobalt-api.kwiatekmiki.com'
+    'https://cobalt-api.kwiatekmiki.com',
+    'https://api.cobalt.best'
   ];
   for (const node of cobaltNodes) {
-    resolvers.push((async () => {
+    tasks.push((async () => {
       const res = await fetchTimeout(`${node}/`, {
         method: 'POST',
         headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
@@ -115,16 +169,14 @@ async function resolveWorkingMedia(targetUrl, mode = 'video', quality = '720') {
           downloadMode: mode === 'audio' ? 'audio' : 'auto'
         })
       }, 4500);
-      if (!res.ok) throw new Error('Cobalt failed');
+      if (!res.ok) throw new Error('Cobalt error');
       const data = await res.json();
-      if (data && data.url) {
-        return { url: data.url, mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4' };
-      }
-      throw new Error('No Cobalt URL');
+      if (data && data.url) return { url: data.url, mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4' };
+      throw new Error('No Cobalt url');
     })());
   }
 
-  return await Promise.any(resolvers);
+  return await Promise.any(tasks);
 }
 
 module.exports = async (req, res) => {
@@ -139,52 +191,78 @@ module.exports = async (req, res) => {
   const pathname = urlObj.pathname;
 
   try {
-    // 1. PING
     if (pathname === '/api/ping') {
       return res.status(200).json({ status: 'online', timestamp: Date.now() });
     }
 
-    // 2. SEARCH
+    // SEARCH WITH CATEGORY FILTER (all, video, audio, podcast, radio)
     if (pathname === '/api/search') {
       const q = urlObj.searchParams.get('q');
+      const filter = (urlObj.searchParams.get('filter') || 'all').toLowerCase();
       if (!q) return res.status(400).json({ error: 'Missing query' });
 
-      const r = await yts(q);
-      const items = (r.videos || []).slice(0, 20).map(v => ({
-        id: v.videoId,
-        title: v.title,
-        uploader: (v.author && v.author.name) ? v.author.name : 'Unknown',
-        duration: v.seconds || 0,
-        thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-        url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`
-      }));
+      if (filter === 'radio') {
+        const radioRes = await fetchTimeout(`https://de1.api.radio-browser.info/json/stations/search?name=${encodeURIComponent(q)}&hidebroken=true&order=clickcount&reverse=true&limit=20`, {}, 4500);
+        const stations = radioRes.ok ? await radioRes.json() : [];
+        return res.status(200).json(stations.filter(s => s.url_resolved).map(s => ({
+          id: s.stationuuid,
+          title: s.name.trim(),
+          uploader: s.country || s.tags || 'Live Radio',
+          duration: 0,
+          thumbnail: s.favicon || 'https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?w=300&q=80',
+          url: s.url_resolved,
+          directStreamUrl: s.url_resolved,
+          mediaType: 'audio',
+          isLiveRadio: true
+        })));
+      }
+
+      const effectiveQuery =
+        filter === 'audio' ? `${q} official audio` :
+        filter === 'podcast' ? `${q} full podcast episode` :
+        q;
+
+      const r = await yts(effectiveQuery);
+      const items = (r.videos || []).slice(0, 22).map(v => {
+        const lowerTitle = (v.title || '').toLowerCase();
+        const inferredAudio = filter === 'audio' || filter === 'podcast' || lowerTitle.includes('audio') || lowerTitle.includes('lyrics') || lowerTitle.includes('topic');
+        return {
+          id: v.videoId,
+          title: v.title,
+          uploader: (v.author && v.author.name) ? v.author.name : 'Unknown',
+          duration: v.seconds || 0,
+          thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+          url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`,
+          mediaType: filter === 'video' ? 'video' : (inferredAudio ? 'audio' : 'video')
+        };
+      });
       return res.status(200).json(items);
     }
 
-    // 3. RELATED TRACKS (For Auto-Play Related Media after Queue ends)
     if (pathname === '/api/related') {
       const title = urlObj.searchParams.get('title') || '';
       const uploader = urlObj.searchParams.get('uploader') || '';
       const currentId = urlObj.searchParams.get('id') || '';
-      const searchQuery = `${uploader} ${title}`.trim() || 'popular music';
+      const cleanTitle = title.replace(/\(.*?\)|\[.*?\]/g, '').trim();
+      const searchQuery = `${uploader} ${cleanTitle} mix`.trim() || 'top hits music';
 
       const r = await yts(searchQuery);
       const candidates = (r.videos || [])
         .filter(v => v.videoId !== currentId)
-        .slice(0, 8)
+        .slice(0, 10)
         .map(v => ({
           id: v.videoId,
           title: v.title,
           uploader: (v.author && v.author.name) ? v.author.name : 'Unknown',
           duration: v.seconds || 0,
           thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`
+          url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`,
+          mediaType: 'audio'
         }));
 
       return res.status(200).json(candidates);
     }
 
-    // 4. DIRECT URL INFO
     if (pathname === '/api/info') {
       const targetUrl = urlObj.searchParams.get('url');
       if (!targetUrl) return res.status(400).json({ error: 'Missing url' });
@@ -198,7 +276,8 @@ module.exports = async (req, res) => {
           uploader: (v.author && v.author.name) ? v.author.name : 'YouTube',
           duration: v.seconds || 0,
           thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-          url: `https://www.youtube.com/watch?v=${videoId}`
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+          mediaType: 'video'
         });
       }
 
@@ -206,15 +285,15 @@ module.exports = async (req, res) => {
       const oembed = oembedRes.ok ? await oembedRes.json() : {};
       return res.status(200).json({
         id: String(Date.now()),
-        title: oembed.title || 'Media Link',
+        title: oembed.title || 'Direct Media',
         uploader: oembed.author_name || oembed.provider_name || 'Web',
         duration: 0,
         thumbnail: oembed.thumbnail_url || '',
-        url: targetUrl
+        url: targetUrl,
+        mediaType: 'video'
       });
     }
 
-    // 5. RESOLVE STREAM
     if (pathname === '/api/resolve-stream') {
       const targetUrl = urlObj.searchParams.get('url');
       const mode = urlObj.searchParams.get('mode') || 'video';
@@ -227,13 +306,12 @@ module.exports = async (req, res) => {
       });
     }
 
-    // 6. STREAM & CHUNKED DOWNLOAD PROXY
     if (pathname === '/api/stream') {
       const targetUrl = urlObj.searchParams.get('url');
       const mode = urlObj.searchParams.get('mode') || 'video';
       const quality = urlObj.searchParams.get('quality') || '720';
       const startByte = parseInt(urlObj.searchParams.get('start') || '0', 10);
-      const chunkSize = 2.5 * 1024 * 1024; // 2.5 MB safe chunk under Vercel 4.5MB limit
+      const chunkSize = 2.5 * 1024 * 1024;
 
       const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
 
@@ -245,12 +323,12 @@ module.exports = async (req, res) => {
       const upstream = await fetch(resolved.url, {
         headers: {
           'Range': `bytes=${startByte}-${endByte}`,
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)'
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X)'
         }
       });
 
       if (!upstream.ok && upstream.status !== 206) {
-        throw new Error(`Upstream HTTP ${upstream.status}`);
+        throw new Error(`Upstream status ${upstream.status}`);
       }
 
       const contentRange = upstream.headers.get('content-range');
