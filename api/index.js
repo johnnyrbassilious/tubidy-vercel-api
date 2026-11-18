@@ -9,200 +9,219 @@ const PIPED_INSTANCES = [
 ];
 
 const COBALT_INSTANCES = [
-  'https://cobalt.aelew.dev',
-  'https://cobalt-api.kwiatekmiki.com'
+  'https://cobalt-api.kwiatekmiki.com',
+  'https://cobalt.api.timelessnesses.me'
 ];
 
-async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 6000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
     clearTimeout(id);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } finally {
+    return res;
+  } catch (err) {
     clearTimeout(id);
+    throw err;
   }
 }
 
-async function extractMediaStreams(targetUrl) {
-  // 1. Try @distube/ytdl-core for YouTube URLs
-  if (ytdl.validateURL(targetUrl)) {
-    try {
-      const info = await ytdl.getInfo(targetUrl);
-      const videoFormats = info.formats.filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4');
-      const audioFormats = info.formats.filter(f => !f.hasVideo && f.hasAudio);
-      return {
-        id: info.videoDetails.videoId,
-        title: info.videoDetails.title,
-        uploader: info.videoDetails.author?.name || 'YouTube',
-        duration: Number(info.videoDetails.lengthSeconds || 0),
-        thumbnail: info.videoDetails.thumbnails?.slice(-1)[0]?.url || '',
-        url: targetUrl,
-        streams: {
-          '1080': (videoFormats.find(f => f.height === 1080) || videoFormats[0])?.url,
-          '720': (videoFormats.find(f => f.height === 720) || videoFormats[0])?.url,
-          '480': (videoFormats.find(f => f.height === 480) || videoFormats[0])?.url,
-          '360': (videoFormats.find(f => f.height === 360) || videoFormats[videoFormats.length - 1])?.url,
-          'audio': (audioFormats.find(f => f.container === 'm4a') || audioFormats[0] || videoFormats[0])?.url
-        }
-      };
-    } catch (e) {
-      // Fall through to Piped / Cobalt fallback if datacenter IP is rate-limited
-    }
+function extractYouTubeId(inputUrl) {
+  const match = inputUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+  return match ? match[1] : null;
+}
 
-    // 2. Fallback to Piped public nodes for YouTube video IDs
-    const videoId = ytdl.getURLVideoID(targetUrl);
-    for (const host of PIPED_INSTANCES) {
-      try {
-        const data = await fetchJsonWithTimeout(`${host}/streams/${videoId}`);
-        const vStreams = (data.videoStreams || []).filter(s => !s.videoOnly);
-        const aStreams = data.audioStreams || [];
-        if (vStreams.length || aStreams.length) {
-          return {
-            id: videoId,
-            title: data.title || 'Media Stream',
-            uploader: data.uploader || 'YouTube',
-            duration: data.duration || 0,
-            thumbnail: data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-            url: targetUrl,
-            streams: {
-              '1080': (vStreams.find(s => s.quality === '1080p') || vStreams[0])?.url,
-              '720': (vStreams.find(s => s.quality === '720p') || vStreams[0])?.url,
-              '480': (vStreams.find(s => s.quality === '480p') || vStreams[0])?.url,
-              '360': (vStreams.find(s => s.quality === '360p') || vStreams[vStreams.length - 1])?.url,
-              'audio': (aStreams.find(s => s.mimeType?.includes('mp4')) || aStreams[0] || vStreams[0])?.url
-            }
-          };
-        }
-      } catch {}
-    }
-  }
-
-  // 3. Multi-platform fallback (TikTok, SoundCloud, Instagram, X, YouTube) via Cobalt API
+async function resolveDirectStreamUrl(targetUrl, mode, quality) {
+  // 1. Try Cobalt API instances first (works for YouTube, TikTok, Instagram, SoundCloud, X)
   for (const instance of COBALT_INSTANCES) {
     try {
-      const vData = await fetchJsonWithTimeout(instance, {
+      const res = await fetchWithTimeout(`${instance}/`, {
         method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl, videoQuality: '720', downloadMode: 'auto' })
-      });
-      const aData = await fetchJsonWithTimeout(instance, {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl, downloadMode: 'audio', audioFormat: 'mp3' })
-      }).catch(() => null);
-
-      if (vData && vData.url) {
-        return {
-          id: String(Date.now()),
-          title: vData.filename || 'Direct Media Stream',
-          uploader: new URL(targetUrl).hostname.replace('www.', ''),
-          duration: 0,
-          thumbnail: '',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
           url: targetUrl,
-          streams: {
-            '1080': vData.url,
-            '720': vData.url,
-            '480': vData.url,
-            '360': vData.url,
-            'audio': aData?.url || vData.url
-          }
-        };
+          videoQuality: String(quality || '720'),
+          audioFormat: 'mp3',
+          downloadMode: mode === 'audio' ? 'audio' : 'auto'
+        })
+      }, 6000);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.url) return data.url;
       }
-    } catch {}
+    } catch (_) {}
   }
 
-  // 4. Direct MP4/MP3 URL passthrough
-  return {
-    id: String(Date.now()),
-    title: targetUrl.split('/').pop()?.split('?')[0] || 'Direct Media',
-    uploader: 'Direct Link',
-    duration: 0,
-    thumbnail: '',
-    url: targetUrl,
-    streams: { '1080': targetUrl, '720': targetUrl, '480': targetUrl, '360': targetUrl, 'audio': targetUrl }
-  };
+  // 2. Fallback to Piped Streams API for YouTube URLs
+  const videoId = extractYouTubeId(targetUrl);
+  if (videoId) {
+    for (const piped of PIPED_INSTANCES) {
+      try {
+        const res = await fetchWithTimeout(`${piped}/streams/${videoId}`, {}, 6000);
+        if (res.ok) {
+          const data = await res.json();
+          if (mode === 'audio' && Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
+            const sortedAudio = data.audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+            return sortedAudio[0].url;
+          }
+          if (Array.isArray(data.videoStreams) && data.videoStreams.length > 0) {
+            const withAudio = data.videoStreams.filter(s => s.videoOnly === false);
+            const pool = withAudio.length > 0 ? withAudio : data.videoStreams;
+            const matched = pool.find(s => (s.quality || '').includes(String(quality))) || pool[0];
+            if (matched && matched.url) return matched.url;
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 3. Fallback to @distube/ytdl-core
+    const info = await ytdl.getInfo(targetUrl);
+    if (mode === 'audio') {
+      const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
+      if (format && format.url) return format.url;
+    } else {
+      const formats = info.formats.filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4');
+      const matched = formats.find(f => String(f.height) === String(quality)) || formats[0] || ytdl.chooseFormat(info.formats, { quality: 'highest' });
+      if (matched && matched.url) return matched.url;
+    }
+  }
+
+  throw new Error('Could not resolve direct media stream from upstream providers.');
 }
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
 
-  const path = req.url.split('?')[0];
-
-  // Endpoint 1: Health check
-  if (path.endsWith('/ping')) {
-    return res.status(200).json({ status: 'online', engine: 'Vercel Serverless 24/7', timestamp: Date.now() });
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
 
-  // Endpoint 2: Search
-  if (path.endsWith('/search')) {
-    const q = req.query.q;
-    if (!q) return res.status(400).json({ error: 'Missing query parameter q' });
-    try {
-      const r = await yts(q);
-      const videos = (r.videos || []).slice(0, 15).map(v => ({
+  const urlObj = new URL(req.url, `https://${req.headers.host}`);
+  const pathname = urlObj.pathname;
+
+  try {
+    // 1. PING ENDPOINT
+    if (pathname === '/api/ping') {
+      return res.status(200).json({
+        status: 'online',
+        server: 'Vercel Serverless Engine',
+        timestamp: Date.now()
+      });
+    }
+
+    // 2. SEARCH ENDPOINT
+    if (pathname === '/api/search') {
+      const q = urlObj.searchParams.get('q');
+      if (!q) return res.status(400).json({ error: 'Missing search query parameter q' });
+
+      const searchResult = await yts(q);
+      const videos = (searchResult.videos || []).slice(0, 18).map(v => ({
         id: v.videoId,
         title: v.title,
-        uploader: v.author?.name || 'Unknown',
+        uploader: (v.author && v.author.name) ? v.author.name : 'Unknown Artist',
         duration: v.seconds || 0,
         thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-        url: v.url
+        url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`
       }));
+
       return res.status(200).json(videos);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
     }
-  }
 
-  // Endpoint 3: Info & Direct Stream URLs
-  if (path.endsWith('/info')) {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
-    try {
-      const info = await extractMediaStreams(targetUrl);
-      return res.status(200).json(info);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
+    // 3. INFO / LINK RESOLVER ENDPOINT
+    if (pathname === '/api/info') {
+      const targetUrl = urlObj.searchParams.get('url');
+      if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
-  // Endpoint 4: Stream Redirect / CORS Proxy
-  if (path.endsWith('/stream')) {
-    const { url, mode = 'video', quality = '720', proxy = '0' } = req.query;
-    if (!url) return res.status(400).send('Missing url');
-    try {
-      const info = await extractMediaStreams(url);
-      const targetStreamUrl = mode === 'audio'
-        ? (info.streams['audio'] || info.streams['360'])
-        : (info.streams[quality] || info.streams['720'] || info.streams['360']);
-
-      if (!targetStreamUrl) return res.status(404).json({ error: 'No stream found' });
-
-      if (proxy === '1') {
-        const upstream = await fetch(targetStreamUrl, {
-          headers: req.headers.range ? { Range: req.headers.range } : {}
+      const videoId = extractYouTubeId(targetUrl);
+      if (videoId) {
+        const video = await yts({ videoId });
+        return res.status(200).json({
+          id: video.videoId || videoId,
+          title: video.title || 'Resolved Media',
+          uploader: (video.author && video.author.name) ? video.author.name : 'YouTube',
+          duration: video.seconds || 0,
+          thumbnail: video.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          url: targetUrl
         });
-        res.status(upstream.status);
-        upstream.headers.forEach((val, key) => {
-          if (['content-type', 'content-length', 'content-range', 'accept-ranges'].includes(key.toLowerCase())) {
-            res.setHeader(key, val);
-          }
-        });
-        const arrayBuffer = await upstream.arrayBuffer();
-        return res.send(Buffer.from(arrayBuffer));
       }
 
-      // Redirect directly so the iPhone downloads from the CDN without burning cloud CPU
-      return res.redirect(302, targetStreamUrl);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+      // Non-YouTube URLs (TikTok, SoundCloud, Instagram, X) via noembed oEmbed
+      const oembedRes = await fetchWithTimeout(`https://noembed.com/embed?url=${encodeURIComponent(targetUrl)}`);
+      const oembed = oembedRes.ok ? await oembedRes.json() : {};
+      return res.status(200).json({
+        id: String(Date.now()),
+        title: oembed.title || targetUrl.split('/').pop() || 'External Platform Media',
+        uploader: oembed.author_name || oembed.provider_name || 'Direct Link',
+        duration: 0,
+        thumbnail: oembed.thumbnail_url || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=600&q=80',
+        url: targetUrl
+      });
     }
-  }
 
-  return res.status(200).json({ status: 'ready' });
+    // 4.RESOLVE DIRECT STREAM URL ENDPOINT
+    if (pathname === '/api/resolve-stream') {
+      const targetUrl = urlObj.searchParams.get('url');
+      const mode = urlObj.searchParams.get('mode') || 'video';
+      const quality = urlObj.searchParams.get('quality') || '720';
+      if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
+
+      const directUrl = await resolveDirectStreamUrl(targetUrl, mode, quality);
+      return res.status(200).json({
+        directUrl,
+        proxyUrl: `https://${req.headers.host}/api/stream?url=${encodeURIComponent(targetUrl)}&mode=${mode}&quality=${quality}`
+      });
+    }
+
+    // 5. CHUNK-SAFE STREAM & PROXY ENDPOINT (Bypasses Vercel 4.5MB limit via Range headers)
+    if (pathname === '/api/stream') {
+      const targetUrl = urlObj.searchParams.get('url');
+      const mode = urlObj.searchParams.get('mode') || 'video';
+      const quality = urlObj.searchParams.get('quality') || '720';
+      const startByte = parseInt(urlObj.searchParams.get('start') || '0', 10);
+      const chunkSize = 3 * 1024 * 1024; // 3 MB safe chunk size under Vercel 4.5 MB limit
+
+      if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
+
+      const directUrl = await resolveDirectStreamUrl(targetUrl, mode, quality);
+
+      // If browser/player requests directly without chunking parameter, redirect to the signed CDN stream
+      if (!urlObj.searchParams.has('chunked')) {
+        return res.redirect(302, directUrl);
+      }
+
+      const endByte = startByte + chunkSize - 1;
+      const upstream = await fetch(directUrl, {
+        headers: {
+          'Range': `bytes=${startByte}-${endByte}`,
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)'
+        }
+      });
+
+      const contentRange = upstream.headers.get('content-range');
+      const contentType = upstream.headers.get('content-type') || (mode === 'audio' ? 'audio/mp4' : 'video/mp4');
+
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Accept-Ranges', 'bytes');
+
+      const arrayBuffer = await upstream.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      res.setHeader('Content-Length', buffer.length);
+      return res.status(upstream.status === 206 ? 206 : 200).send(buffer);
+    }
+
+    return res.status(200).json({
+      service: 'TubidyFM Vercel API',
+      status: 'ready',
+      endpoints: ['/api/ping', '/api/search?q=', '/api/info?url=', '/api/resolve-stream', '/api/stream']
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Server error' });
+  }
 };
