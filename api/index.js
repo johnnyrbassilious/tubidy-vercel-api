@@ -178,162 +178,27 @@ async function fetchYTMusicRadio(videoId) {
   return results;
 }
 
-// Multi-Engine Stream & Download Resolver
-async function resolveWorkingMedia(targetUrl, mode = 'audio', quality = '720') {
+// Direct Media Resolver (handles direct audio/video URLs & live radio streams)
+async function resolveWorkingMedia(targetUrl, mode = 'audio') {
+  if (!targetUrl) {
+    throw new Error('Missing url parameter');
+  }
+
   const videoId = extractYouTubeId(targetUrl);
-  const fullUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : targetUrl;
-  const qNum = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
 
   // Direct audio/video files (e.g., Radio streams or direct MP3/MP4 links)
-  if (!videoId && /\.(mp3|m4a|mp4|aac|ogg|wav)(\?|$)/i.test(targetUrl)) {
-    return { url: targetUrl, mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4' };
+  if (!videoId && /^https?:\/\//i.test(targetUrl)) {
+    return {
+      url: targetUrl,
+      mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4'
+    };
   }
 
-  const tasks = [];
-
-  // Engine 1: Loader.to / Oceansaver API
-  tasks.push((async () => {
-    const format = mode === 'audio' ? 'mp3' : String(qNum);
-    const initRes = await fetchTimeout(
-      `https://ab.cococococ.com/ajax/download.php?copyright=0&format=${format}&url=${encodeURIComponent(fullUrl)}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X)' } },
-      5000
-    );
-    if (!initRes.ok) throw new Error('Loader init failed');
-    const initData = await initRes.json();
-    if (!initData || !initData.id) throw new Error('No Loader task ID');
-
-    for (let i = 0; i < 8; i++) {
-      await new Promise(r => setTimeout(r, 900));
-      const progRes = await fetchTimeout(`https://p.oceansaver.in/ajax/progress.php?id=${initData.id}`, {}, 4000);
-      if (!progRes.ok) continue;
-      const progData = await progRes.json();
-      if (progData && progData.download_url) {
-        return {
-          url: progData.download_url,
-          mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4'
-        };
-      }
-    }
-    throw new Error('Loader timeout');
-  })());
-
-  // Engine 2: Savetube CDN Extractor
-  tasks.push((async () => {
-    const cdnRes = await fetchTimeout('https://media.savetube.me/api/random-cdn', {}, 3500);
-    const cdnData = cdnRes.ok ? await cdnRes.json() : { cdn: 'cdn54.savetube.su' };
-    const cdnHost = cdnData.cdn || 'cdn54.savetube.su';
-
-    const infoRes = await fetchTimeout(`https://${cdnHost}/info`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-      body: JSON.stringify({ url: fullUrl })
-    }, 4500);
-    if (!infoRes.ok) throw new Error('Savetube info failed');
-    const infoJson = await infoRes.json();
-    const key = infoJson?.data?.key;
-    if (!key) throw new Error('No Savetube key');
-
-    const dlRes = await fetchTimeout(`https://${cdnHost}/download`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-      body: JSON.stringify({
-        downloadType: mode === 'audio' ? 'audio' : 'video',
-        quality: mode === 'audio' ? '128' : String(qNum),
-        key
-      })
-    }, 5000);
-    if (!dlRes.ok) throw new Error('Savetube dl failed');
-    const dlJson = await dlRes.json();
-    const dlUrl = dlJson?.data?.downloadUrl;
-    if (dlUrl) {
-      return {
-        url: dlUrl,
-        mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4'
-      };
-    }
-    throw new Error('No Savetube URL');
-  })());
-
-  // Engine 3: Piped & Invidious Proxied Streams
   if (videoId) {
-    const pipedNodes = [
-      'https://api.piped.private.coffee',
-      'https://pipedapi.drgns.space',
-      'https://pipedapi.adminforge.de',
-      'https://pipedapi.reallyaweso.me'
-    ];
-    for (const node of pipedNodes) {
-      tasks.push((async () => {
-        const res = await fetchTimeout(`${node}/streams/${videoId}`, {}, 4000);
-        if (!res.ok) throw new Error('Piped status ' + res.status);
-        const data = await res.json();
-        if (mode === 'audio' && Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
-          const best = data.audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-          if (best && best.url) return { url: best.url, mime: best.mimeType || 'audio/mp4' };
-        }
-        const vids = (data.videoStreams || []).filter(v => v.videoOnly === false);
-        const pool = vids.length > 0 ? vids : (data.videoStreams || []);
-        const match = pool.find(v => (v.quality || '').includes(String(qNum))) || pool[0];
-        if (match && match.url) return { url: match.url, mime: 'video/mp4' };
-        throw new Error('No Piped stream');
-      })());
-    }
-
-    const invNodes = [
-      'https://inv.nadeko.net',
-      'https://invidious.nerdvpn.de',
-      'https://iv.datura.network',
-      'https://invidious.perennialte.ch'
-    ];
-    for (const node of invNodes) {
-      tasks.push((async () => {
-        const res = await fetchTimeout(`${node}/api/v1/videos/${videoId}`, {}, 4000);
-        if (!res.ok) throw new Error('Invidious failed');
-        const data = await res.json();
-        if (mode === 'audio' && Array.isArray(data.adaptiveFormats)) {
-          const aud = data.adaptiveFormats
-            .filter(f => (f.type || '').startsWith('audio/'))
-            .sort((a, b) => (parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0)))[0];
-          if (aud && aud.itag) {
-            return { url: `${node}/latest_version?id=${videoId}&itag=${aud.itag}&local=true`, mime: 'audio/mp4' };
-          }
-        }
-        const fmt = (data.formatStreams || [])[0];
-        if (fmt && fmt.itag) {
-          return { url: `${node}/latest_version?id=${videoId}&itag=${fmt.itag}&local=true`, mime: 'video/mp4' };
-        }
-        throw new Error('No Inv format');
-      })());
-    }
+    throw new Error(`Direct stream extraction is unavailable for YouTube ID ${videoId}. Use /api/embed?id=${videoId} for playback.`);
   }
 
-  // Engine 4: Cobalt Multi-Platform Nodes
-  const cobaltNodes = [
-    'https://cobalt-backend.canine.tools',
-    'https://cobalt-api.kwiatekmiki.com',
-    'https://c.blahaj.ca'
-  ];
-  for (const node of cobaltNodes) {
-    tasks.push((async () => {
-      const res = await fetchTimeout(`${node}/`, {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: fullUrl,
-          videoQuality: String(qNum),
-          audioFormat: 'mp3',
-          downloadMode: mode === 'audio' ? 'audio' : 'auto'
-        })
-      }, 4500);
-      if (!res.ok) throw new Error('Cobalt error');
-      const data = await res.json();
-      if (data && data.url) return { url: data.url, mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4' };
-      throw new Error('No Cobalt url');
-    })());
-  }
-
-  return await Promise.any(tasks);
+  throw new Error('Unsupported media URL');
 }
 
 module.exports = async (req, res) => {
@@ -350,6 +215,30 @@ module.exports = async (req, res) => {
   try {
     if (pathname === '/api/ping') {
       return res.status(200).json({ status: 'online', timestamp: Date.now() });
+    }
+
+    // OFFICIAL YOUTUBE EMBED WRAPPER (Fixes iOS Capacitor Error 153 by providing an HTTPS Referer)
+    if (pathname === '/api/embed') {
+      const id = extractYouTubeId(urlObj.searchParams.get('id') || urlObj.searchParams.get('url'));
+      if (!id) return res.status(400).send('Missing video id');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <style>
+    html, body, iframe { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; border: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <iframe
+    src="https://www.youtube.com/embed/${id}?playsinline=1&rel=0&enablejsapi=1&autoplay=1"
+    referrerpolicy="strict-origin-when-cross-origin"
+    allow="autoplay; encrypted-media; picture-in-picture"
+    allowfullscreen>
+  </iframe>
+</body>
+</html>`);
     }
 
     // 1. AUTOCOMPLETE & TYPO SUGGESTIONS
@@ -592,7 +481,7 @@ module.exports = async (req, res) => {
       const targetUrl = urlObj.searchParams.get('url');
       const mode = urlObj.searchParams.get('mode') || 'audio';
       const quality = urlObj.searchParams.get('quality') || '720';
-      const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
+      const resolved = await resolveWorkingMedia(targetUrl, mode);
       return res.status(200).json({
         directUrl: resolved.url,
         mime: resolved.mime,
@@ -603,11 +492,10 @@ module.exports = async (req, res) => {
     if (pathname === '/api/stream') {
       const targetUrl = urlObj.searchParams.get('url');
       const mode = urlObj.searchParams.get('mode') || 'audio';
-      const quality = urlObj.searchParams.get('quality') || '720';
       const startByte = parseInt(urlObj.searchParams.get('start') || '0', 10);
       const chunkSize = 2.5 * 1024 * 1024;
 
-      const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
+      const resolved = await resolveWorkingMedia(targetUrl, mode);
 
       if (!urlObj.searchParams.has('chunked')) {
         return res.redirect(302, resolved.url);
@@ -637,6 +525,9 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({ status: 'ready' });
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'Resolution failed' });
+    const details = Array.isArray(err.errors)
+      ? err.errors.map(e => e?.message || String(e))
+      : undefined;
+    return res.status(500).json({ error: err.message || 'Resolution failed', details });
   }
 };
