@@ -217,7 +217,7 @@ module.exports = async (req, res) => {
       return res.status(200).json({ status: 'online', timestamp: Date.now() });
     }
 
-    // OFFICIAL YOUTUBE EMBED WRAPPER (Fixes iOS Capacitor Error 153 by providing an HTTPS Referer)
+    // OFFICIAL YOUTUBE EMBED BRIDGE (Fixes iOS Capacitor Error 153 + syncs player controls)
     if (pathname === '/api/embed') {
       const id = extractYouTubeId(urlObj.searchParams.get('id') || urlObj.searchParams.get('url'));
       if (!id) return res.status(400).send('Missing video id');
@@ -227,16 +227,75 @@ module.exports = async (req, res) => {
 <head>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <style>
-    html, body, iframe { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; border: 0; overflow: hidden; }
+    html, body, #player { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; border: 0; overflow: hidden; }
   </style>
 </head>
 <body>
-  <iframe
-    src="https://www.youtube.com/embed/${id}?playsinline=1&rel=0&enablejsapi=1&autoplay=1"
-    referrerpolicy="strict-origin-when-cross-origin"
-    allow="autoplay; encrypted-media; picture-in-picture"
-    allowfullscreen>
-  </iframe>
+  <div id="player"></div>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>
+    var player = null;
+    var pollTimer = null;
+    var videoId = ${JSON.stringify(id)};
+
+    function notify(type, payload) {
+      try {
+        window.parent.postMessage(Object.assign({ source: 'jtunes-yt', type: type }, payload || {}), '*');
+      } catch (e) {}
+    }
+
+    function onYouTubeIframeAPIReady() {
+      player = new YT.Player('player', {
+        videoId: videoId,
+        width: '100%',
+        height: '100%',
+        playerVars: {
+          autoplay: 1,
+          controls: 0,
+          modestbranding: 1,
+          rel: 0,
+          playsinline: 1,
+          enablejsapi: 1,
+          origin: window.location.origin
+        },
+        events: {
+          onReady: function(ev) {
+            var dur = ev.target.getDuration();
+            notify('ready', { duration: isFinite(dur) ? dur : 0 });
+            ev.target.playVideo();
+            pollTimer = setInterval(function() {
+              if (!player || !player.getCurrentTime) return;
+              try {
+                var t = player.getCurrentTime();
+                var d = player.getDuration();
+                if (isFinite(t) && isFinite(d)) {
+                  notify('time', { currentTime: t, duration: d });
+                }
+              } catch (e) {}
+            }, 500);
+          },
+          onStateChange: function(ev) {
+            notify('state', { state: ev.data });
+          },
+          onError: function(ev) {
+            notify('error', { code: typeof ev.data === 'number' ? ev.data : 0 });
+          }
+        }
+      });
+    }
+
+    window.addEventListener('message', function(event) {
+      var msg = event.data;
+      if (!msg || msg.source !== 'jtunes-app' || !player) return;
+      try {
+        if (msg.cmd === 'play') player.playVideo();
+        else if (msg.cmd === 'pause') player.pauseVideo();
+        else if (msg.cmd === 'seekTo') player.seekTo(Number(msg.seconds) || 0, true);
+        else if (msg.cmd === 'setPlaybackRate') player.setPlaybackRate(Number(msg.rate) || 1);
+        else if (msg.cmd === 'setPlaybackQuality' && player.setPlaybackQuality) player.setPlaybackQuality(msg.quality);
+      } catch (e) {}
+    });
+  </script>
 </body>
 </html>`);
     }
