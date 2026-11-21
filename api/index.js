@@ -52,6 +52,109 @@ function deduplicateItems(items) {
   return out;
 }
 
+// Late-2026 InnerTube Player Profiles (VISIONOS requires no PO token or JS solver)
+const INNERTUBE_PLAYER_PROFILES = [
+  {
+    name: 'VISIONOS',
+    clientNameHeader: '101',
+    clientVersion: '1.02',
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+    client: {
+      clientName: 'VISIONOS',
+      clientVersion: '1.02',
+      deviceMake: 'Apple',
+      deviceModel: 'RealityDevice17,1',
+      osName: 'visionOS',
+      osVersion: '26.5.23O471',
+      hl: 'en',
+      gl: 'US'
+    }
+  },
+  {
+    name: 'ANDROID_VR',
+    clientNameHeader: '28',
+    clientVersion: '1.65.10',
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+    client: {
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.65.10',
+      deviceMake: 'Oculus',
+      deviceModel: 'Quest 3',
+      androidSdkVersion: 32,
+      osName: 'Android',
+      osVersion: '12L',
+      hl: 'en',
+      gl: 'US'
+    }
+  },
+  {
+    name: 'IOS',
+    clientNameHeader: '5',
+    clientVersion: '20.11.6',
+    userAgent:
+      'com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+    client: {
+      clientName: 'IOS',
+      clientVersion: '20.11.6',
+      deviceMake: 'Apple',
+      deviceModel: 'iPhone16,2',
+      osName: 'iPhone',
+      osVersion: '18.3.2.22D82',
+      hl: 'en',
+      gl: 'US'
+    }
+  }
+];
+
+function pickInnertubeFormat(streamingData, mode = 'audio', quality = '720') {
+  if (!streamingData || typeof streamingData !== 'object') return null;
+
+  const formats = Array.isArray(streamingData.formats) ? streamingData.formats : [];
+  const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats)
+    ? streamingData.adaptiveFormats
+    : [];
+
+  if (mode === 'audio') {
+    const allAudio = [...adaptiveFormats, ...formats].filter(
+      (f) => typeof f.url === 'string' && f.url.length > 0 && String(f.mimeType || '').startsWith('audio/')
+    );
+    const mp4Audio = allAudio.filter((f) => String(f.mimeType || '').toLowerCase().includes('audio/mp4'));
+    const pool = mp4Audio.length > 0 ? mp4Audio : allAudio;
+    if (pool.length > 0) {
+      pool.sort((a, b) => Number(b.bitrate || b.averageBitrate || 0) - Number(a.bitrate || a.averageBitrate || 0));
+      const best = pool[0];
+      const mime = String(best.mimeType || 'audio/mp4').split(';')[0].trim() || 'audio/mp4';
+      return { url: best.url, mime };
+    }
+    if (typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl) {
+      return { url: streamingData.hlsManifestUrl, mime: 'application/x-mpegURL' };
+    }
+    return null;
+  }
+
+  const desiredHeight = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
+  const progressiveMp4 = formats.filter(
+    (f) => typeof f.url === 'string' && f.url.length > 0 && String(f.mimeType || '').includes('video/mp4')
+  );
+  if (progressiveMp4.length > 0) {
+    progressiveMp4.sort((a, b) => Number(b.height || 0) - Number(a.height || 0));
+    const chosen =
+      progressiveMp4.find((f) => Number(f.height || 0) === desiredHeight) ||
+      progressiveMp4.find((f) => Number(f.height || 0) > 0 && Number(f.height || 0) <= desiredHeight) ||
+      progressiveMp4[progressiveMp4.length - 1];
+    const mime = String(chosen.mimeType || 'video/mp4').split(';')[0].trim() || 'video/mp4';
+    return { url: chosen.url, mime };
+  }
+
+  if (typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl) {
+    return { url: streamingData.hlsManifestUrl, mime: 'application/x-mpegURL' };
+  }
+
+  return null;
+}
+
 // YouTube Music WEB_REMIX Search (strictly separates Songs vs Videos without overwriting titles/art)
 async function searchYouTubeMusic(query, params) {
   const res = await fetchTimeout('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
@@ -178,8 +281,8 @@ async function fetchYTMusicRadio(videoId) {
   return results;
 }
 
-// Direct Media Resolver (handles direct audio/video URLs & live radio streams)
-async function resolveWorkingMedia(targetUrl, mode = 'audio') {
+// Direct & InnerTube Media Resolver
+async function resolveWorkingMedia(targetUrl, mode = 'audio', quality = '720') {
   if (!targetUrl) {
     throw new Error('Missing url parameter');
   }
@@ -194,11 +297,60 @@ async function resolveWorkingMedia(targetUrl, mode = 'audio') {
     };
   }
 
-  if (videoId) {
-    throw new Error(`Direct stream extraction is unavailable for YouTube ID ${videoId}. Use /api/embed?id=${videoId} for playback.`);
+  if (!videoId) {
+    throw new Error('Unsupported media URL');
   }
 
-  throw new Error('Unsupported media URL');
+  const errors = [];
+  for (const profile of INNERTUBE_PLAYER_PROFILES) {
+    try {
+      const resp = await fetchTimeout(
+        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': profile.userAgent,
+            'X-YouTube-Client-Name': profile.clientNameHeader,
+            'X-YouTube-Client-Version': profile.clientVersion,
+            'Origin': 'https://www.youtube.com'
+          },
+          body: JSON.stringify({
+            videoId,
+            context: { client: profile.client },
+            contentCheckOk: true,
+            racyCheckOk: true
+          })
+        },
+        4500
+      );
+
+      if (!resp.ok) {
+        errors.push(`${profile.name}: HTTP ${resp.status}`);
+        continue;
+      }
+
+      const data = await resp.json();
+      const status = data?.playabilityStatus?.status;
+      if (status && status !== 'OK') {
+        const reason = data?.playabilityStatus?.reason || status;
+        errors.push(`${profile.name}: ${reason}`);
+        continue;
+      }
+
+      const picked = pickInnertubeFormat(data?.streamingData, mode, quality);
+      if (picked && picked.url) {
+        return picked;
+      }
+      errors.push(`${profile.name}: no matching stream format`);
+    } catch (err) {
+      errors.push(`${profile.name}: ${err?.message || String(err)}`);
+    }
+  }
+
+  const aggregate = new Error('All server stream resolvers failed');
+  aggregate.errors = errors;
+  throw aggregate;
 }
 
 module.exports = async (req, res) => {
@@ -321,7 +473,7 @@ module.exports = async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 2. ACCURATE PLATFORM-SEPARATED SEARCH (ZERO TITLE OVERWRITING, DEDUPLICATED)
+    // 2. ACCURATE PLATFORM-SEPARATED SEARCH
     if (pathname === '/api/search') {
       const q = (urlObj.searchParams.get('q') || '').trim();
       const filter = (urlObj.searchParams.get('filter') || 'all').toLowerCase();
@@ -366,7 +518,7 @@ module.exports = async (req, res) => {
         );
       }
 
-      // B) STRICT AUDIO FILTER (YouTube Music Songs catalog only — exact titles & art)
+      // B) STRICT AUDIO FILTER
       if (filter === 'audio') {
         let songs = await searchYouTubeMusic(q, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []);
         if (songs.length === 0 && correctedQuery !== q) {
@@ -387,7 +539,7 @@ module.exports = async (req, res) => {
         return res.status(200).json(cleaned.slice(0, 20));
       }
 
-      // C) STRICT VIDEO FILTER (YouTube Music Videos / YouTube MP4 uploads only)
+      // C) STRICT VIDEO FILTER
       if (filter === 'video') {
         let vids = await searchYouTubeMusic(q, 'EgWKAQIQAWoMEA4QChADEAQQCRAF').catch(() => []);
         if (vids.length === 0) {
@@ -424,7 +576,7 @@ module.exports = async (req, res) => {
         return res.status(200).json(deduplicateItems(podResults).slice(0, 20));
       }
 
-      // E) "ALL" FILTER (Interleaves genuine YT Music Audio + genuine YouTube Videos)
+      // E) "ALL" FILTER
       const [songs, ytVids] = await Promise.all([
         searchYouTubeMusic(q, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []),
         searchYouTubeMusic(q, 'EgWKAQIQAWoMEA4QChADEAQQCRAF').catch(() => [])
@@ -456,7 +608,7 @@ module.exports = async (req, res) => {
       return res.status(200).json(deduplicateItems(combined).slice(0, 24));
     }
 
-    // 3. REAL YOUTUBE MUSIC RADIO AUTOPLAY (RDAMVM recommendation graph + Listening History)
+    // 3. REAL YOUTUBE MUSIC RADIO AUTOPLAY
     if (pathname === '/api/related') {
       const title = urlObj.searchParams.get('title') || '';
       const uploader = (urlObj.searchParams.get('uploader') || '').replace(' - Topic', '').trim();
@@ -472,7 +624,6 @@ module.exports = async (req, res) => {
         candidates = await fetchYTMusicRadio(currentId).catch(() => []);
       }
 
-      // Blend songs from user's recent listening history artists
       if (historyArtists.length > 0) {
         const tasteArtist = historyArtists.find(a => a.toLowerCase() !== uploader.toLowerCase()) || historyArtists[0];
         if (tasteArtist) {
@@ -481,7 +632,6 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Fallback if RDAMVM returned empty
       if (candidates.length === 0 && uploader && uploader.toLowerCase() !== 'unknown') {
         const artistSongs = await searchYouTubeMusic(uploader, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []);
         candidates.push(...artistSongs.map(s => ({ ...s, mediaType: 'audio', platform: 'YT Music' })));
@@ -505,7 +655,7 @@ module.exports = async (req, res) => {
     }
 
     if (pathname === '/api/info') {
-      const targetUrl = urlObj.searchParams.get('url');
+      const targetUrl = urlObj.searchParams.get('url') || urlObj.searchParams.get('id');
       if (!targetUrl) return res.status(400).json({ error: 'Missing url' });
 
       const videoId = extractYouTubeId(targetUrl);
@@ -537,10 +687,10 @@ module.exports = async (req, res) => {
     }
 
     if (pathname === '/api/resolve-stream') {
-      const targetUrl = urlObj.searchParams.get('url');
+      const targetUrl = urlObj.searchParams.get('url') || urlObj.searchParams.get('id');
       const mode = urlObj.searchParams.get('mode') || 'audio';
       const quality = urlObj.searchParams.get('quality') || '720';
-      const resolved = await resolveWorkingMedia(targetUrl, mode);
+      const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
       return res.status(200).json({
         directUrl: resolved.url,
         mime: resolved.mime,
@@ -549,12 +699,13 @@ module.exports = async (req, res) => {
     }
 
     if (pathname === '/api/stream') {
-      const targetUrl = urlObj.searchParams.get('url');
+      const targetUrl = urlObj.searchParams.get('url') || urlObj.searchParams.get('id');
       const mode = urlObj.searchParams.get('mode') || 'audio';
+      const quality = urlObj.searchParams.get('quality') || '720';
       const startByte = parseInt(urlObj.searchParams.get('start') || '0', 10);
       const chunkSize = 2.5 * 1024 * 1024;
 
-      const resolved = await resolveWorkingMedia(targetUrl, mode);
+      const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
 
       if (!urlObj.searchParams.has('chunked')) {
         return res.redirect(302, resolved.url);
@@ -564,7 +715,8 @@ module.exports = async (req, res) => {
       const upstream = await fetch(resolved.url, {
         headers: {
           'Range': `bytes=${startByte}-${endByte}`,
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X)'
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15'
         }
       });
 
@@ -574,7 +726,7 @@ module.exports = async (req, res) => {
 
       const contentRange = upstream.headers.get('content-range');
       if (contentRange) res.setHeader('Content-Range', contentRange);
-      res.setHeader('Content-Type', resolved.mime || (mode === 'audio' ? 'audio/mpeg' : 'video/mp4'));
+      res.setHeader('Content-Type', resolved.mime || (mode === 'audio' ? 'audio/mp4' : 'video/mp4'));
       res.setHeader('Accept-Ranges', 'bytes');
 
       const buf = Buffer.from(await upstream.arrayBuffer());
