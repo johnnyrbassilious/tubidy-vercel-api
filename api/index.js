@@ -1,36 +1,20 @@
-const yts = require('yt-search');
-
-function extractYouTubeId(inputUrl) {
-  if (!inputUrl) return null;
-  const match = inputUrl.match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([a-zA-Z0-9_-]{11})/);
-  return match ? match[1] : (/^[a-zA-Z0-9_-]{11}$/.test(inputUrl) ? inputUrl : null);
-}
-
 async function fetchTimeout(url, options = {}, ms = 6500) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, { redirect: 'follow', ...options, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
 }
 
 function normalizeTitle(str = '') {
-  return str
+  return String(str)
     .toLowerCase()
     .replace(/\(.*?\)|\[.*?\]/g, '')
-    .replace(/official|video|audio|lyrics|lyric|hd|4k|remastered|mv|visualizer/gi, '')
+    .replace(/official|video|audio|lyrics|hd|4k|remastered/gi, '')
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim();
-}
-
-function parseDurationToSeconds(text = '') {
-  const parts = String(text).trim().split(':').map(Number);
-  if (parts.some(isNaN)) return 0;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return 0;
 }
 
 function deduplicateItems(items) {
@@ -42,7 +26,7 @@ function deduplicateItems(items) {
     if (!item || !item.id || seenIds.has(item.id)) continue;
     const normTitle = normalizeTitle(item.title);
     const normArtist = normalizeTitle(item.uploader);
-    const key = `${normTitle}::${normArtist}`;
+    const key = `${normTitle}::${normArtist}::${item.mediaType || ''}`;
     if (normTitle && seenKeys.has(key)) continue;
 
     seenIds.add(item.id);
@@ -52,305 +36,345 @@ function deduplicateItems(items) {
   return out;
 }
 
-// Late-2026 InnerTube Player Profiles (VISIONOS requires no PO token or JS solver)
-const INNERTUBE_PLAYER_PROFILES = [
-  {
-    name: 'VISIONOS',
-    clientNameHeader: '101',
-    clientVersion: '1.02',
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
-    client: {
-      clientName: 'VISIONOS',
-      clientVersion: '1.02',
-      deviceMake: 'Apple',
-      deviceModel: 'RealityDevice17,1',
-      osName: 'visionOS',
-      osVersion: '26.5.23O471',
-      hl: 'en',
-      gl: 'US'
+// 1. AUDIUS (Open Decentralized Music — 320kbps direct MP3, no API key)
+let cachedAudiusHost = null;
+async function getAudiusHost() {
+  if (cachedAudiusHost) return cachedAudiusHost;
+  try {
+    const res = await fetchTimeout('https://api.audius.co', {}, 3000);
+    if (res.ok) {
+      const json = await res.json();
+      if (Array.isArray(json.data) && json.data.length > 0) {
+        cachedAudiusHost = json.data[0].replace(/\/+$/, '');
+        return cachedAudiusHost;
+      }
     }
-  },
-  {
-    name: 'ANDROID_VR',
-    clientNameHeader: '28',
-    clientVersion: '1.65.10',
-    userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-    client: {
-      clientName: 'ANDROID_VR',
-      clientVersion: '1.65.10',
-      deviceMake: 'Oculus',
-      deviceModel: 'Quest 3',
-      androidSdkVersion: 32,
-      osName: 'Android',
-      osVersion: '12L',
-      hl: 'en',
-      gl: 'US'
-    }
-  },
-  {
-    name: 'IOS',
-    clientNameHeader: '5',
-    clientVersion: '20.11.6',
-    userAgent:
-      'com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
-    client: {
-      clientName: 'IOS',
-      clientVersion: '20.11.6',
-      deviceMake: 'Apple',
-      deviceModel: 'iPhone16,2',
-      osName: 'iPhone',
-      osVersion: '18.3.2.22D82',
-      hl: 'en',
-      gl: 'US'
-    }
-  }
-];
+  } catch (_) {}
+  return 'https://discoveryprovider.audius.co';
+}
 
-function pickInnertubeFormat(streamingData, mode = 'audio', quality = '720') {
-  if (!streamingData || typeof streamingData !== 'object') return null;
-
-  const formats = Array.isArray(streamingData.formats) ? streamingData.formats : [];
-  const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats)
-    ? streamingData.adaptiveFormats
-    : [];
-
-  if (mode === 'audio') {
-    const allAudio = [...adaptiveFormats, ...formats].filter(
-      (f) => typeof f.url === 'string' && f.url.length > 0 && String(f.mimeType || '').startsWith('audio/')
-    );
-    const mp4Audio = allAudio.filter((f) => String(f.mimeType || '').toLowerCase().includes('audio/mp4'));
-    const pool = mp4Audio.length > 0 ? mp4Audio : allAudio;
-    if (pool.length > 0) {
-      pool.sort((a, b) => Number(b.bitrate || b.averageBitrate || 0) - Number(a.bitrate || a.averageBitrate || 0));
-      const best = pool[0];
-      const mime = String(best.mimeType || 'audio/mp4').split(';')[0].trim() || 'audio/mp4';
-      return { url: best.url, mime };
-    }
-    if (typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl) {
-      return { url: streamingData.hlsManifestUrl, mime: 'application/x-mpegURL' };
-    }
-    return null;
-  }
-
-  const desiredHeight = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
-  const progressiveMp4 = formats.filter(
-    (f) => typeof f.url === 'string' && f.url.length > 0 && String(f.mimeType || '').includes('video/mp4')
+async function searchAudius(query, limit = 15) {
+  const host = await getAudiusHost();
+  const res = await fetchTimeout(
+    `${host}/v1/tracks/search?query=${encodeURIComponent(query)}&app_name=Jtunes`,
+    {},
+    4500
   );
-  if (progressiveMp4.length > 0) {
-    progressiveMp4.sort((a, b) => Number(b.height || 0) - Number(a.height || 0));
-    const chosen =
-      progressiveMp4.find((f) => Number(f.height || 0) === desiredHeight) ||
-      progressiveMp4.find((f) => Number(f.height || 0) > 0 && Number(f.height || 0) <= desiredHeight) ||
-      progressiveMp4[progressiveMp4.length - 1];
-    const mime = String(chosen.mimeType || 'video/mp4').split(';')[0].trim() || 'video/mp4';
-    return { url: chosen.url, mime };
-  }
-
-  if (typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl) {
-    return { url: streamingData.hlsManifestUrl, mime: 'application/x-mpegURL' };
-  }
-
-  return null;
-}
-
-// YouTube Music WEB_REMIX Search (strictly separates Songs vs Videos without overwriting titles/art)
-async function searchYouTubeMusic(query, params) {
-  const res = await fetchTimeout('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Origin': 'https://music.youtube.com',
-      'Referer': 'https://music.youtube.com/'
-    },
-    body: JSON.stringify({
-      query,
-      params,
-      context: {
-        client: {
-          clientName: 'WEB_REMIX',
-          clientVersion: '1.20260901.01.00',
-          hl: 'en',
-          gl: 'US'
-        }
-      }
-    })
-  }, 4500);
-
   if (!res.ok) return [];
-  const data = await res.json();
-  const items = [];
+  const json = await res.json();
+  const tracks = Array.isArray(json.data) ? json.data : [];
 
-  const tabs = data?.contents?.tabbedSearchResultsRenderer?.tabs || [];
-  const sections = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-
-  for (const sec of sections) {
-    const shelfItems = sec?.musicShelfRenderer?.contents || [];
-    for (const entry of shelfItems) {
-      const r = entry?.musicResponsiveListItemRenderer;
-      if (!r) continue;
-
-      const videoId =
-        r?.playlistItemData?.videoId ||
-        r?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
-      if (!videoId) continue;
-
-      const flexCols = r.flexColumns || [];
-      const title =
-        flexCols[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.map(x => x.text).join('') || '';
-      const subRuns =
-        flexCols[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-      const subTexts = subRuns.map(x => x.text).filter(t => t && t.trim() !== '•' && t.trim() !== '&');
-
-      const durationText = subTexts.find(t => /^\d+:\d+(:\d+)?$/.test(t.trim())) || '';
-      const uploader = subTexts.find(t => !/^\d+:\d+/.test(t.trim()) && !/plays|views|song|video/i.test(t)) || 'YouTube Music';
-      const thumbs = r?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-      const thumb = thumbs.length ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-
-      if (title) {
-        items.push({
-          id: videoId,
-          title: title.trim(),
-          uploader: uploader.replace(' - Topic', '').trim(),
-          duration: parseDurationToSeconds(durationText),
-          thumbnail: thumb,
-          url: `https://www.youtube.com/watch?v=${videoId}`
-        });
-      }
-    }
-  }
-  return items;
-}
-
-// YouTube Music Real Radio / Up Next Engine (RDAMVM{videoId})
-async function fetchYTMusicRadio(videoId) {
-  const res = await fetchTimeout('https://music.youtube.com/youtubei/v1/next?prettyPrint=false', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Origin': 'https://music.youtube.com'
-    },
-    body: JSON.stringify({
-      videoId,
-      playlistId: `RDAMVM${videoId}`,
-      isAudioOnly: true,
-      context: {
-        client: {
-          clientName: 'WEB_REMIX',
-          clientVersion: '1.20260901.01.00',
-          hl: 'en',
-          gl: 'US'
-        }
-      }
-    })
-  }, 4500);
-
-  if (!res.ok) return [];
-  const data = await res.json();
-  const queueContents =
-    data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer
-      ?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer?.contents || [];
-
-  const results = [];
-  for (const row of queueContents) {
-    const r = row?.playlistPanelVideoRenderer;
-    if (!r || !r.videoId || r.videoId === videoId) continue;
-
-    const title = r?.title?.runs?.map(x => x.text).join('') || '';
-    const artist = r?.longBylineText?.runs?.[0]?.text || r?.shortBylineText?.runs?.[0]?.text || 'YouTube Music';
-    const durText = r?.lengthText?.runs?.[0]?.text || '';
-    const thumbs = r?.thumbnail?.thumbnails || [];
-    const thumb = thumbs.length ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${r.videoId}/hqdefault.jpg`;
-
-    if (title) {
-      results.push({
-        id: r.videoId,
-        title: title.trim(),
-        uploader: artist.replace(' - Topic', '').trim(),
-        duration: parseDurationToSeconds(durText),
-        thumbnail: thumb,
-        url: `https://www.youtube.com/watch?v=${r.videoId}`,
+  return tracks
+    .filter((t) => t && t.id && t.title && t.is_streamable !== false)
+    .slice(0, limit)
+    .map((t) => {
+      const streamUrl = `${host}/v1/tracks/${encodeURIComponent(t.id)}/stream?app_name=Jtunes`;
+      const artwork =
+        t.artwork?.['480x480'] ||
+        t.artwork?.['1000x1000'] ||
+        t.artwork?.['150x150'] ||
+        'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80';
+      return {
+        id: `audius_${t.id}`,
+        title: String(t.title).trim(),
+        uploader: String(t.user?.name || 'Audius Artist').trim(),
+        duration: Number(t.duration) || 0,
+        thumbnail: artwork,
+        url: streamUrl,
+        directStreamUrl: streamUrl,
         mediaType: 'audio',
-        platform: 'YT Music'
-      });
-    }
-  }
-  return results;
+        platform: 'Audius'
+      };
+    });
 }
 
-// Direct & InnerTube Media Resolver
-async function resolveWorkingMedia(targetUrl, mode = 'audio', quality = '720') {
-  if (!targetUrl) {
-    throw new Error('Missing url parameter');
+// 2. APPLE ITUNES PODCAST EPISODES (Direct MP3/M4A episodeUrl, no API key)
+async function searchPodcastEpisodes(query, limit = 15) {
+  const res = await fetchTimeout(
+    `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=podcast&entity=podcastEpisode&limit=${limit}`,
+    {},
+    4500
+  );
+  if (!res.ok) return [];
+  const json = await res.json();
+  const results = Array.isArray(json.results) ? json.results : [];
+
+  return results
+    .filter((ep) => ep && typeof ep.episodeUrl === 'string' && /^https?:\/\//i.test(ep.episodeUrl))
+    .map((ep) => ({
+      id: `pod_${ep.trackId || ep.episodeGuid || Date.now()}`,
+      title: String(ep.trackName || ep.collectionName || 'Podcast Episode').trim(),
+      uploader: String(ep.collectionName || ep.artistName || 'Podcast').trim(),
+      duration: Math.round((Number(ep.trackTimeMillis) || 0) / 1000),
+      thumbnail:
+        ep.artworkUrl600 ||
+        ep.artworkUrl160 ||
+        'https://images.unsplash.com/photo-1478737270239-2f02b77fc618?w=400&q=80',
+      url: ep.episodeUrl,
+      directStreamUrl: ep.episodeUrl,
+      mediaType: 'audio',
+      platform: 'Podcast'
+    }));
+}
+
+// 3. OPENVERSE AUDIO (Creative Commons Music & Soundscapes — filtered to iOS-compatible formats)
+async function searchOpenverseAudio(query, limit = 12) {
+  const res = await fetchTimeout(
+    `https://api.openverse.org/v1/audio/?q=${encodeURIComponent(query)}&page_size=${limit}`,
+    { headers: { 'User-Agent': 'Jtunes/1.0' } },
+    4500
+  );
+  if (!res.ok) return [];
+  const json = await res.json();
+  const results = Array.isArray(json.results) ? json.results : [];
+  const iosSafeTypes = new Set(['mp3', 'm4a', 'wav', 'aac', 'mp4']);
+
+  return results
+    .filter((item) => {
+      if (!item || typeof item.url !== 'string' || !/^https:\/\//i.test(item.url)) return false;
+      const ft = String(item.filetype || '').toLowerCase();
+      return iosSafeTypes.has(ft) || /\.(mp3|m4a|wav|aac)(\?|$)/i.test(item.url);
+    })
+    .map((item) => ({
+      id: `ov_${item.id}`,
+      title: String(item.title || 'Open Audio').trim(),
+      uploader: String(item.creator || 'Openverse').trim(),
+      duration: Math.round((Number(item.duration) || 0) / 1000),
+      thumbnail:
+        item.thumbnail ||
+        'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=400&q=80',
+      url: item.url,
+      directStreamUrl: item.url,
+      mediaType: 'audio',
+      platform: 'Openverse'
+    }));
+}
+
+// 4. INTERNET ARCHIVE (Massive open Audio + Video catalog — resolves to direct MP3/MP4)
+async function searchInternetArchive(query, mediaKind = 'audio', limit = 12) {
+  const safeQ = query.replace(/["():]/g, ' ').trim();
+  if (!safeQ) return [];
+  const mediatypeFilter = mediaKind === 'video' ? 'mediatype:(movies)' : 'mediatype:(audio OR etree)';
+  const fullQ = `(${safeQ}) AND ${mediatypeFilter}`;
+  const searchUrl =
+    `https://archive.org/advancedsearch.php?q=${encodeURIComponent(fullQ)}` +
+    `&fl[]=identifier&fl[]=title&fl[]=creator&sort[]=downloads+desc&rows=${limit}&page=1&output=json`;
+
+  const res = await fetchTimeout(searchUrl, {}, 4500);
+  if (!res.ok) return [];
+  const json = await res.json();
+  const docs = Array.isArray(json?.response?.docs) ? json.response.docs : [];
+
+  return docs
+    .filter((d) => d && d.identifier && d.title)
+    .map((d) => {
+      const id = String(d.identifier);
+      const creator = Array.isArray(d.creator) ? d.creator[0] : d.creator;
+      return {
+        id: `ia_${mediaKind}_${id}`,
+        title: String(Array.isArray(d.title) ? d.title[0] : d.title).trim(),
+        uploader: String(creator || 'Internet Archive').trim(),
+        duration: 0,
+        thumbnail: `https://archive.org/services/img/${encodeURIComponent(id)}`,
+        url: `https://archive.org/details/${encodeURIComponent(id)}`,
+        mediaType: mediaKind === 'video' ? 'video' : 'audio',
+        platform: 'Archive.org'
+      };
+    });
+}
+
+async function resolveInternetArchiveFile(identifier, mode = 'audio') {
+  const res = await fetchTimeout(
+    `https://archive.org/metadata/${encodeURIComponent(identifier)}`,
+    {},
+    5000
+  );
+  if (!res.ok) throw new Error(`Archive metadata HTTP ${res.status}`);
+  const data = await res.json();
+  const files = Array.isArray(data.files) ? data.files : [];
+
+  if (mode === 'video') {
+    const mp4s = files.filter(
+      (f) => f && typeof f.name === 'string' && /\.mp4$/i.test(f.name) && !/_thumb|sample/i.test(f.name)
+    );
+    if (mp4s.length > 0) {
+      // Prefer h.264 / MPEG4 standard derivative for universal iOS playback
+      const chosen =
+        mp4s.find((f) => /h\.264|mpeg4/i.test(String(f.format || ''))) || mp4s[0];
+      return {
+        url: `https://archive.org/download/${encodeURIComponent(identifier)}/${encodeURIComponent(chosen.name).replace(/%2F/g, '/')}`,
+        mime: 'video/mp4'
+      };
+    }
   }
 
-  const videoId = extractYouTubeId(targetUrl);
-
-  // Direct audio/video files (e.g., Radio streams or direct MP3/MP4 links)
-  if (!videoId && /^https?:\/\//i.test(targetUrl)) {
+  const audioFiles = files.filter(
+    (f) =>
+      f &&
+      typeof f.name === 'string' &&
+      /\.(mp3|m4a|wav)$/i.test(f.name) &&
+      !/sample|preview/i.test(f.name)
+  );
+  if (audioFiles.length > 0) {
+    const chosen =
+      audioFiles.find((f) => /\.mp3$/i.test(f.name)) ||
+      audioFiles.find((f) => /\.m4a$/i.test(f.name)) ||
+      audioFiles[0];
+    const mime = /\.m4a$/i.test(chosen.name)
+      ? 'audio/mp4'
+      : /\.wav$/i.test(chosen.name)
+        ? 'audio/wav'
+        : 'audio/mpeg';
     return {
-      url: targetUrl,
-      mime: mode === 'audio' ? 'audio/mpeg' : 'video/mp4'
+      url: `https://archive.org/download/${encodeURIComponent(identifier)}/${encodeURIComponent(chosen.name).replace(/%2F/g, '/')}`,
+      mime
     };
   }
 
-  if (!videoId) {
-    throw new Error('Unsupported media URL');
+  throw new Error('No iOS-compatible MP3/MP4 file found in this Archive item');
+}
+
+// 5. PEERTUBE VIA SEPIA SEARCH (Unrestricted open-source video network — direct MP4/HLS)
+async function searchPeerTube(query, limit = 14) {
+  const res = await fetchTimeout(
+    `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(query)}&count=${limit}&nsfw=false`,
+    {},
+    4500
+  );
+  if (!res.ok) return [];
+  const json = await res.json();
+  const videos = Array.isArray(json.data) ? json.data : [];
+
+  return videos
+    .filter((v) => v && v.uuid && v.name && (v.account?.host || v.channel?.host || v.url))
+    .map((v) => {
+      let host = v.account?.host || v.channel?.host || '';
+      if (!host && v.url) {
+        try {
+          host = new URL(v.url).host;
+        } catch (_) {}
+      }
+      const apiDetailUrl = `https://${host}/api/v1/videos/${v.uuid}`;
+      return {
+        id: `pt_${v.uuid}`,
+        title: String(v.name).trim(),
+        uploader: String(v.channel?.displayName || v.account?.displayName || 'PeerTube').trim(),
+        duration: Number(v.duration) || 0,
+        thumbnail:
+          v.thumbnailUrl ||
+          v.previewUrl ||
+          'https://images.unsplash.com/photo-1485846234645-a62644f84728?w=400&q=80',
+        url: apiDetailUrl,
+        mediaType: 'video',
+        platform: 'PeerTube'
+      };
+    });
+}
+
+async function resolvePeerTubeVideo(apiUrl, mode = 'video', quality = '720') {
+  const res = await fetchTimeout(apiUrl, {}, 5000);
+  if (!res.ok) throw new Error(`PeerTube HTTP ${res.status}`);
+  const data = await res.json();
+
+  const desiredHeight = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
+  const rootFiles = Array.isArray(data.files) ? data.files : [];
+  const hlsPlaylists = Array.isArray(data.streamingPlaylists) ? data.streamingPlaylists : [];
+  const playlistFiles = hlsPlaylists.flatMap((pl) => (Array.isArray(pl.files) ? pl.files : []));
+  const allFiles = [...rootFiles, ...playlistFiles].filter(
+    (f) => f && (typeof f.fileUrl === 'string' || typeof f.fileDownloadUrl === 'string')
+  );
+
+  if (allFiles.length > 0) {
+    const sorted = [...allFiles].sort(
+      (a, b) => Number(b.resolution?.id || 0) - Number(a.resolution?.id || 0)
+    );
+    const chosen =
+      mode === 'audio'
+        ? sorted[sorted.length - 1]
+        : sorted.find((f) => Number(f.resolution?.id || 0) === desiredHeight) ||
+          sorted.find((f) => Number(f.resolution?.id || 0) > 0 && Number(f.resolution?.id || 0) <= desiredHeight) ||
+          sorted[sorted.length - 1];
+
+    const fileUrl = chosen.fileUrl || chosen.fileDownloadUrl;
+    return {
+      url: fileUrl,
+      mime: mode === 'audio' ? 'audio/mp4' : 'video/mp4'
+    };
   }
 
-  const errors = [];
-  for (const profile of INNERTUBE_PLAYER_PROFILES) {
-    try {
-      const resp = await fetchTimeout(
-        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': profile.userAgent,
-            'X-YouTube-Client-Name': profile.clientNameHeader,
-            'X-YouTube-Client-Version': profile.clientVersion,
-            'Origin': 'https://www.youtube.com'
-          },
-          body: JSON.stringify({
-            videoId,
-            context: { client: profile.client },
-            contentCheckOk: true,
-            racyCheckOk: true
-          })
-        },
-        4500
-      );
-
-      if (!resp.ok) {
-        errors.push(`${profile.name}: HTTP ${resp.status}`);
-        continue;
-      }
-
-      const data = await resp.json();
-      const status = data?.playabilityStatus?.status;
-      if (status && status !== 'OK') {
-        const reason = data?.playabilityStatus?.reason || status;
-        errors.push(`${profile.name}: ${reason}`);
-        continue;
-      }
-
-      const picked = pickInnertubeFormat(data?.streamingData, mode, quality);
-      if (picked && picked.url) {
-        return picked;
-      }
-      errors.push(`${profile.name}: no matching stream format`);
-    } catch (err) {
-      errors.push(`${profile.name}: ${err?.message || String(err)}`);
-    }
+  const hlsUrl = hlsPlaylists.find((pl) => typeof pl.playlistUrl === 'string')?.playlistUrl;
+  if (hlsUrl) {
+    return { url: hlsUrl, mime: 'application/x-mpegURL' };
   }
 
-  const aggregate = new Error('All server stream resolvers failed');
-  aggregate.errors = errors;
-  throw aggregate;
+  throw new Error('No direct MP4/HLS stream available on this PeerTube instance');
+}
+
+// 6. RADIO BROWSER (Filtered strictly to working HTTPS stations for iOS)
+async function searchLiveRadio(query, limit = 25) {
+  const res = await fetchTimeout(
+    `https://de1.api.radio-browser.info/json/stations/search?name=${encodeURIComponent(query)}&hidebroken=true&order=clickcount&reverse=true&limit=${limit}`,
+    {},
+    4500
+  );
+  if (!res.ok) return [];
+  const stations = await res.json();
+  if (!Array.isArray(stations)) return [];
+
+  const httpsOnly = stations.filter(
+    (s) => s && typeof s.url_resolved === 'string' && s.url_resolved.startsWith('https://')
+  );
+  const healthy = httpsOnly.filter((s) => s.lastcheckok === 1);
+  const pool = healthy.length > 0 ? healthy : httpsOnly;
+
+  return pool.slice(0, 20).map((s) => ({
+    id: `radio_${s.stationuuid}`,
+    title: String(s.name || 'Live Radio').trim(),
+    uploader: `${s.country || 'Live'} • Radio`,
+    duration: 0,
+    thumbnail:
+      (s.favicon && s.favicon.startsWith('https://') ? s.favicon : '') ||
+      'https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?w=400&q=80',
+    url: s.url_resolved,
+    directStreamUrl: s.url_resolved,
+    mediaType: 'audio',
+    platform: 'Radio',
+    isLiveRadio: true
+  }));
+}
+
+// UNIFIED UNRESTRICTED MEDIA RESOLVER
+async function resolveOpenMedia(targetUrl, mode = 'audio', quality = '720') {
+  if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+    throw new Error('Missing or invalid media URL');
+  }
+
+  // Internet Archive details page -> resolve direct MP3/MP4
+  const iaMatch = targetUrl.match(/archive\.org\/details\/([^/?#]+)/i);
+  if (iaMatch) {
+    return await resolveInternetArchiveFile(decodeURIComponent(iaMatch[1]), mode);
+  }
+
+  // PeerTube API detail URL -> resolve direct MP4/HLS
+  if (/\/api\/v1\/videos\/[a-zA-Z0-9-]+/i.test(targetUrl)) {
+    return await resolvePeerTubeVideo(targetUrl, mode, quality);
+  }
+
+  // Direct stream (Audius, Apple Podcasts MP3, Openverse, Radio, or custom URL)
+  const inferredMime =
+    /\.mp4(\?|$)/i.test(targetUrl)
+      ? 'video/mp4'
+      : /\.m4a(\?|$)/i.test(targetUrl)
+        ? 'audio/mp4'
+        : /\.wav(\?|$)/i.test(targetUrl)
+          ? 'audio/wav'
+          : /\.m3u8(\?|$)/i.test(targetUrl)
+            ? 'application/x-mpegURL'
+            : mode === 'video'
+              ? 'video/mp4'
+              : 'audio/mpeg';
+
+  return { url: targetUrl, mime: inferredMime };
 }
 
 module.exports = async (req, res) => {
@@ -366,100 +390,16 @@ module.exports = async (req, res) => {
 
   try {
     if (pathname === '/api/ping') {
-      return res.status(200).json({ status: 'online', timestamp: Date.now() });
+      return res.status(200).json({ status: 'online', mode: 'open-sources', timestamp: Date.now() });
     }
 
-    // OFFICIAL YOUTUBE EMBED BRIDGE (Fixes iOS Capacitor Error 153 + syncs player controls)
-    if (pathname === '/api/embed') {
-      const id = extractYouTubeId(urlObj.searchParams.get('id') || urlObj.searchParams.get('url'));
-      if (!id) return res.status(400).send('Missing video id');
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      return res.status(200).send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-  <style>
-    html, body, #player { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; border: 0; overflow: hidden; }
-  </style>
-</head>
-<body>
-  <div id="player"></div>
-  <script src="https://www.youtube.com/iframe_api"></script>
-  <script>
-    var player = null;
-    var pollTimer = null;
-    var videoId = ${JSON.stringify(id)};
-
-    function notify(type, payload) {
-      try {
-        window.parent.postMessage(Object.assign({ source: 'jtunes-yt', type: type }, payload || {}), '*');
-      } catch (e) {}
-    }
-
-    function onYouTubeIframeAPIReady() {
-      player = new YT.Player('player', {
-        videoId: videoId,
-        width: '100%',
-        height: '100%',
-        playerVars: {
-          autoplay: 1,
-          controls: 0,
-          modestbranding: 1,
-          rel: 0,
-          playsinline: 1,
-          enablejsapi: 1,
-          origin: window.location.origin
-        },
-        events: {
-          onReady: function(ev) {
-            var dur = ev.target.getDuration();
-            notify('ready', { duration: isFinite(dur) ? dur : 0 });
-            ev.target.playVideo();
-            pollTimer = setInterval(function() {
-              if (!player || !player.getCurrentTime) return;
-              try {
-                var t = player.getCurrentTime();
-                var d = player.getDuration();
-                if (isFinite(t) && isFinite(d)) {
-                  notify('time', { currentTime: t, duration: d });
-                }
-              } catch (e) {}
-            }, 500);
-          },
-          onStateChange: function(ev) {
-            notify('state', { state: ev.data });
-          },
-          onError: function(ev) {
-            notify('error', { code: typeof ev.data === 'number' ? ev.data : 0 });
-          }
-        }
-      });
-    }
-
-    window.addEventListener('message', function(event) {
-      var msg = event.data;
-      if (!msg || msg.source !== 'jtunes-app' || !player) return;
-      try {
-        if (msg.cmd === 'play') player.playVideo();
-        else if (msg.cmd === 'pause') player.pauseVideo();
-        else if (msg.cmd === 'seekTo') player.seekTo(Number(msg.seconds) || 0, true);
-        else if (msg.cmd === 'setPlaybackRate') player.setPlaybackRate(Number(msg.rate) || 1);
-        else if (msg.cmd === 'setPlaybackQuality' && player.setPlaybackQuality) player.setPlaybackQuality(msg.quality);
-      } catch (e) {}
-    });
-  </script>
-</body>
-</html>`);
-    }
-
-    // 1. AUTOCOMPLETE & TYPO SUGGESTIONS
+    // 1. AUTOCOMPLETE SUGGESTIONS
     if (pathname === '/api/suggestions') {
       const q = (urlObj.searchParams.get('q') || '').trim();
       if (!q) return res.status(200).json([]);
-
       try {
         const sugRes = await fetchTimeout(
-          `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(q)}`,
+          `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(q)}`,
           {},
           2500
         );
@@ -473,179 +413,104 @@ module.exports = async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 2. ACCURATE PLATFORM-SEPARATED SEARCH
+    // 2. MULTI-SOURCE UNRESTRICTED SEARCH (ZERO YOUTUBE)
     if (pathname === '/api/search') {
       const q = (urlObj.searchParams.get('q') || '').trim();
       const filter = (urlObj.searchParams.get('filter') || 'all').toLowerCase();
       if (!q) return res.status(400).json({ error: 'Missing query' });
 
-      let correctedQuery = q;
-      try {
-        const sugRes = await fetchTimeout(
-          `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(q)}`,
-          {},
-          2000
-        );
-        if (sugRes.ok) {
-          const sugData = await sugRes.json();
-          if (Array.isArray(sugData[1]) && sugData[1].length > 0) {
-            correctedQuery = sugData[1][0];
-          }
-        }
-      } catch (_) {}
-
-      // A) LIVE RADIO STATIONS
       if (filter === 'radio') {
-        const radioRes = await fetchTimeout(
-          `https://de1.api.radio-browser.info/json/stations/search?name=${encodeURIComponent(q)}&hidebroken=true&order=clickcount&reverse=true&limit=20`,
-          {},
-          4500
-        );
-        const stations = radioRes.ok ? await radioRes.json() : [];
-        return res.status(200).json(
-          stations.filter(s => s.url_resolved).map(s => ({
-            id: s.stationuuid,
-            title: s.name.trim(),
-            uploader: `${s.country || 'Live'} • Radio`,
-            duration: 0,
-            thumbnail: s.favicon || 'https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?w=300&q=80',
-            url: s.url_resolved,
-            directStreamUrl: s.url_resolved,
-            mediaType: 'audio',
-            platform: 'Radio',
-            isLiveRadio: true
-          }))
-        );
+        const stations = await searchLiveRadio(q, 25).catch(() => []);
+        return res.status(200).json(stations);
       }
 
-      // B) STRICT AUDIO FILTER
-      if (filter === 'audio') {
-        let songs = await searchYouTubeMusic(q, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []);
-        if (songs.length === 0 && correctedQuery !== q) {
-          songs = await searchYouTubeMusic(correctedQuery, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []);
-        }
-        if (songs.length === 0) {
-          const r = await yts(`${q} official audio`);
-          songs = (r.videos || []).map(v => ({
-            id: v.videoId,
-            title: v.title.replace(/\(Official Audio\)|\[Official Audio\]/gi, '').trim(),
-            uploader: (v.author?.name || 'YT Music').replace(' - Topic', '').trim(),
-            duration: v.seconds || 0,
-            thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-            url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`
-          }));
-        }
-        const cleaned = deduplicateItems(songs.map(s => ({ ...s, mediaType: 'audio', platform: 'YT Music' })));
-        return res.status(200).json(cleaned.slice(0, 20));
-      }
-
-      // C) STRICT VIDEO FILTER
-      if (filter === 'video') {
-        let vids = await searchYouTubeMusic(q, 'EgWKAQIQAWoMEA4QChADEAQQCRAF').catch(() => []);
-        if (vids.length === 0) {
-          const r = await yts(q);
-          vids = (r.videos || [])
-            .filter(v => !((v.author?.name) || '').endsWith('- Topic'))
-            .map(v => ({
-              id: v.videoId,
-              title: v.title,
-              uploader: v.author?.name || 'YouTube',
-              duration: v.seconds || 0,
-              thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-              url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`
-            }));
-        }
-        const cleaned = deduplicateItems(vids.map(v => ({ ...v, mediaType: 'video', platform: 'YouTube' })));
-        return res.status(200).json(cleaned.slice(0, 20));
-      }
-
-      // D) PODCAST FILTER
       if (filter === 'podcast') {
-        let r = await yts(`${q} podcast episode`);
-        if (!r.videos || r.videos.length === 0) r = await yts(`${correctedQuery} podcast`);
-        const podResults = (r.videos || []).map(v => ({
-          id: v.videoId,
-          title: v.title,
-          uploader: v.author?.name || 'Podcast',
-          duration: v.seconds || 0,
-          thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`,
-          mediaType: 'audio',
-          platform: 'Podcast'
-        }));
-        return res.status(200).json(deduplicateItems(podResults).slice(0, 20));
+        const [pods, iaPods] = await Promise.all([
+          searchPodcastEpisodes(q, 18).catch(() => []),
+          searchInternetArchive(`${q} podcast`, 'audio', 8).catch(() => [])
+        ]);
+        return res.status(200).json(deduplicateItems([...pods, ...iaPods]).slice(0, 24));
       }
 
-      // E) "ALL" FILTER
-      const [songs, ytVids] = await Promise.all([
-        searchYouTubeMusic(q, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []),
-        searchYouTubeMusic(q, 'EgWKAQIQAWoMEA4QChADEAQQCRAF').catch(() => [])
+      if (filter === 'video') {
+        const [ptVids, iaVids] = await Promise.all([
+          searchPeerTube(q, 15).catch(() => []),
+          searchInternetArchive(q, 'video', 12).catch(() => [])
+        ]);
+        const interleaved = [];
+        for (let i = 0; i < Math.max(ptVids.length, iaVids.length); i++) {
+          if (ptVids[i]) interleaved.push(ptVids[i]);
+          if (iaVids[i]) interleaved.push(iaVids[i]);
+        }
+        return res.status(200).json(deduplicateItems(interleaved).slice(0, 24));
+      }
+
+      if (filter === 'audio') {
+        const [audius, iaAudio, pods, openverse] = await Promise.all([
+          searchAudius(q, 14).catch(() => []),
+          searchInternetArchive(q, 'audio', 10).catch(() => []),
+          searchPodcastEpisodes(q, 6).catch(() => []),
+          searchOpenverseAudio(q, 8).catch(() => [])
+        ]);
+        const interleaved = [];
+        const maxLen = Math.max(audius.length, iaAudio.length, pods.length, openverse.length);
+        for (let i = 0; i < maxLen; i++) {
+          if (audius[i]) interleaved.push(audius[i]);
+          if (iaAudio[i]) interleaved.push(iaAudio[i]);
+          if (pods[i]) interleaved.push(pods[i]);
+          if (openverse[i]) interleaved.push(openverse[i]);
+        }
+        return res.status(200).json(deduplicateItems(interleaved).slice(0, 24));
+      }
+
+      // "ALL" FILTER: combine Music (Audius + Archive + Openverse), Podcasts (iTunes), and Videos (PeerTube)
+      const [audius, pods, iaAudio, ptVids, openverse] = await Promise.all([
+        searchAudius(q, 10).catch(() => []),
+        searchPodcastEpisodes(q, 8).catch(() => []),
+        searchInternetArchive(q, 'audio', 8).catch(() => []),
+        searchPeerTube(q, 8).catch(() => []),
+        searchOpenverseAudio(q, 6).catch(() => [])
       ]);
 
       const combined = [];
-      for (let i = 0; i < Math.max(songs.length, ytVids.length); i++) {
-        if (songs[i]) combined.push({ ...songs[i], mediaType: 'audio', platform: 'YT Music' });
-        if (ytVids[i]) combined.push({ ...ytVids[i], mediaType: 'video', platform: 'YouTube' });
+      const maxLen = Math.max(audius.length, pods.length, iaAudio.length, ptVids.length, openverse.length);
+      for (let i = 0; i < maxLen; i++) {
+        if (audius[i]) combined.push(audius[i]);
+        if (pods[i]) combined.push(pods[i]);
+        if (iaAudio[i]) combined.push(iaAudio[i]);
+        if (ptVids[i]) combined.push(ptVids[i]);
+        if (openverse[i]) combined.push(openverse[i]);
       }
 
-      if (combined.length === 0) {
-        const fallback = await yts(correctedQuery);
-        for (const v of (fallback.videos || []).slice(0, 20)) {
-          const isAudio = (v.author?.name || '').endsWith('- Topic');
-          combined.push({
-            id: v.videoId,
-            title: v.title,
-            uploader: (v.author?.name || 'YouTube').replace(' - Topic', ''),
-            duration: v.seconds || 0,
-            thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-            url: v.url || `https://www.youtube.com/watch?v=${v.videoId}`,
-            mediaType: isAudio ? 'audio' : 'video',
-            platform: isAudio ? 'YT Music' : 'YouTube'
-          });
-        }
-      }
-
-      return res.status(200).json(deduplicateItems(combined).slice(0, 24));
+      return res.status(200).json(deduplicateItems(combined).slice(0, 28));
     }
 
-    // 3. REAL YOUTUBE MUSIC RADIO AUTOPLAY
+    // 3. RELATED AUTOPLAY (Open Sources)
     if (pathname === '/api/related') {
       const title = urlObj.searchParams.get('title') || '';
-      const uploader = (urlObj.searchParams.get('uploader') || '').replace(' - Topic', '').trim();
+      const uploader = (urlObj.searchParams.get('uploader') || '').trim();
       const currentId = urlObj.searchParams.get('id') || '';
-      const historyArtists = (urlObj.searchParams.get('historyArtists') || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
       const excludeNorm = normalizeTitle(title);
 
-      let candidates = [];
-      if (currentId && /^[a-zA-Z0-9_-]{11}$/.test(currentId)) {
-        candidates = await fetchYTMusicRadio(currentId).catch(() => []);
-      }
+      const seedQuery =
+        uploader && uploader.toLowerCase() !== 'unknown' && uploader !== 'Audius Artist'
+          ? uploader
+          : title.split(' ').slice(0, 3).join(' ') || 'chill';
 
-      if (historyArtists.length > 0) {
-        const tasteArtist = historyArtists.find(a => a.toLowerCase() !== uploader.toLowerCase()) || historyArtists[0];
-        if (tasteArtist) {
-          const tasteSongs = await searchYouTubeMusic(tasteArtist, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []);
-          candidates.push(...tasteSongs.slice(0, 4).map(s => ({ ...s, mediaType: 'audio', platform: 'YT Music' })));
-        }
-      }
-
-      if (candidates.length === 0 && uploader && uploader.toLowerCase() !== 'unknown') {
-        const artistSongs = await searchYouTubeMusic(uploader, 'EgWKAQIIAWoMEA4QChADEAQQCRAF').catch(() => []);
-        candidates.push(...artistSongs.map(s => ({ ...s, mediaType: 'audio', platform: 'YT Music' })));
-      }
+      const [audius, pods, iaAudio] = await Promise.all([
+        searchAudius(seedQuery, 8).catch(() => []),
+        searchPodcastEpisodes(seedQuery, 4).catch(() => []),
+        searchInternetArchive(seedQuery, 'audio', 6).catch(() => [])
+      ]);
 
       const seenIds = new Set([currentId]);
       const seenNorms = new Set([excludeNorm]);
       const finalQueue = [];
 
-      for (const item of candidates) {
+      for (const item of [...audius, ...iaAudio, ...pods]) {
         if (!item?.id || seenIds.has(item.id)) continue;
         const norm = normalizeTitle(item.title);
         if (!norm || seenNorms.has(norm)) continue;
-        if (excludeNorm.length > 4 && (norm.includes(excludeNorm) || excludeNorm.includes(norm))) continue;
         seenIds.add(item.id);
         seenNorms.add(norm);
         finalQueue.push(item);
@@ -654,43 +519,32 @@ module.exports = async (req, res) => {
       return res.status(200).json(finalQueue.slice(0, 12));
     }
 
+    // 4. DIRECT URL INFO
     if (pathname === '/api/info') {
-      const targetUrl = urlObj.searchParams.get('url') || urlObj.searchParams.get('id');
+      const targetUrl = urlObj.searchParams.get('url') || '';
       if (!targetUrl) return res.status(400).json({ error: 'Missing url' });
 
-      const videoId = extractYouTubeId(targetUrl);
-      if (videoId) {
-        const v = await yts({ videoId });
-        return res.status(200).json({
-          id: v.videoId || videoId,
-          title: v.title || 'Media',
-          uploader: (v.author && v.author.name) ? v.author.name : 'YouTube',
-          duration: v.seconds || 0,
-          thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-          url: `https://www.youtube.com/watch?v=${videoId}`,
-          mediaType: 'video'
-        });
-      }
-
-      const oembedRes = await fetchTimeout(`https://noembed.com/embed?url=${encodeURIComponent(targetUrl)}`);
-      const oembed = oembedRes.ok ? await oembedRes.json() : {};
-      const isAudioPlatform = /soundcloud\.com|spotify\.com|music\.youtube\.com|deezer\.com/i.test(targetUrl);
+      const isVideo = /\.(mp4|mov|m4v|webm)(\?|$)/i.test(targetUrl);
+      const filename = targetUrl.split('/').pop()?.split('?')[0] || 'Direct Media';
       return res.status(200).json({
-        id: String(Date.now()),
-        title: oembed.title || 'Direct Media',
-        uploader: oembed.author_name || oembed.provider_name || 'Web',
+        id: `direct_${Date.now()}`,
+        title: decodeURIComponent(filename),
+        uploader: new URL(targetUrl).hostname.replace(/^www\./, ''),
         duration: 0,
-        thumbnail: oembed.thumbnail_url || '',
+        thumbnail: '',
         url: targetUrl,
-        mediaType: isAudioPlatform ? 'audio' : 'video'
+        directStreamUrl: targetUrl,
+        mediaType: isVideo ? 'video' : 'audio',
+        platform: 'Direct'
       });
     }
 
+    // 5. STREAM RESOLUTION
     if (pathname === '/api/resolve-stream') {
-      const targetUrl = urlObj.searchParams.get('url') || urlObj.searchParams.get('id');
+      const targetUrl = urlObj.searchParams.get('url') || '';
       const mode = urlObj.searchParams.get('mode') || 'audio';
       const quality = urlObj.searchParams.get('quality') || '720';
-      const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
+      const resolved = await resolveOpenMedia(targetUrl, mode, quality);
       return res.status(200).json({
         directUrl: resolved.url,
         mime: resolved.mime,
@@ -698,27 +552,36 @@ module.exports = async (req, res) => {
       });
     }
 
+    // 6. CORS-SAFE CHUNKED DOWNLOAD PROXY
     if (pathname === '/api/stream') {
-      const targetUrl = urlObj.searchParams.get('url') || urlObj.searchParams.get('id');
+      const targetUrl = urlObj.searchParams.get('url') || '';
       const mode = urlObj.searchParams.get('mode') || 'audio';
       const quality = urlObj.searchParams.get('quality') || '720';
       const startByte = parseInt(urlObj.searchParams.get('start') || '0', 10);
       const chunkSize = 2.5 * 1024 * 1024;
 
-      const resolved = await resolveWorkingMedia(targetUrl, mode, quality);
+      const resolved = await resolveOpenMedia(targetUrl, mode, quality);
 
       if (!urlObj.searchParams.has('chunked')) {
         return res.redirect(302, resolved.url);
       }
 
       const endByte = startByte + chunkSize - 1;
-      const upstream = await fetch(resolved.url, {
-        headers: {
-          'Range': `bytes=${startByte}-${endByte}`,
-          'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15'
-        }
-      });
+      const upstream = await fetchTimeout(
+        resolved.url,
+        {
+          headers: {
+            'Range': `bytes=${startByte}-${endByte}`,
+            'User-Agent': 'Jtunes/1.0'
+          }
+        },
+        8000
+      );
+
+      // Block infinite live radio streams from hanging downloads
+      if (upstream.headers.get('icy-metaint') || upstream.headers.get('icy-name')) {
+        return res.status(400).json({ error: 'Live radio streams cannot be downloaded offline.' });
+      }
 
       if (!upstream.ok && upstream.status !== 206) {
         throw new Error(`Upstream HTTP ${upstream.status}`);
@@ -726,7 +589,8 @@ module.exports = async (req, res) => {
 
       const contentRange = upstream.headers.get('content-range');
       if (contentRange) res.setHeader('Content-Range', contentRange);
-      res.setHeader('Content-Type', resolved.mime || (mode === 'audio' ? 'audio/mp4' : 'video/mp4'));
+      const ct = upstream.headers.get('content-type') || resolved.mime || 'audio/mpeg';
+      res.setHeader('Content-Type', ct);
       res.setHeader('Accept-Ranges', 'bytes');
 
       const buf = Buffer.from(await upstream.arrayBuffer());
@@ -736,9 +600,6 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({ status: 'ready' });
   } catch (err) {
-    const details = Array.isArray(err.errors)
-      ? err.errors.map(e => e?.message || String(e))
-      : undefined;
-    return res.status(500).json({ error: err.message || 'Resolution failed', details });
+    return res.status(500).json({ error: err.message || 'Resolution failed' });
   }
 };
