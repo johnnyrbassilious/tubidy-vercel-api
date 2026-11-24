@@ -39,7 +39,7 @@ function deduplicateItems(items) {
 }
 
 // ---------------------------------------------------------------------------
-// YOUTUBE / YOUTUBE MUSIC (InnerTube, no API key)
+// YOUTUBE / YOUTUBE MUSIC (InnerTube, no API key, no poToken)
 // ---------------------------------------------------------------------------
 
 const YT_CLIENTS = [
@@ -131,36 +131,57 @@ function extractYouTubeId(raw) {
   return null;
 }
 
+// All five clients race in parallel so a slow one can never exhaust the function timeout
+const ytResolveCache = new Map();
+const YT_CACHE_TTL_MS = 5 * 60 * 1000;
+
 async function innertubePlayer(videoId) {
-  for (const client of YT_CLIENTS) {
-    try {
-      const resp = await fetchTimeout(
-        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': client.ua,
-            'X-YouTube-Client-Name': client.cn,
-            'X-YouTube-Client-Version': client.cv,
-            Origin: 'https://www.youtube.com'
-          },
-          body: JSON.stringify({
-            videoId,
-            context: { client: client.body },
-            contentCheckOk: true,
-            racyCheckOk: true
-          })
+  const cached = ytResolveCache.get(videoId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.streamingData;
+  }
+
+  const attempt = async (client) => {
+    const resp = await fetchTimeout(
+      'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': client.ua,
+          'X-YouTube-Client-Name': client.cn,
+          'X-YouTube-Client-Version': client.cv,
+          Origin: 'https://www.youtube.com'
         },
-        8000
-      );
-      if (!resp.ok) continue;
-      const json = await resp.json();
-      if (json?.playabilityStatus?.status && json.playabilityStatus.status !== 'OK') continue;
-      if (!json?.streamingData) continue;
-      return json.streamingData;
-    } catch (_) {
-      // try next client
+        body: JSON.stringify({
+          videoId,
+          context: { client: client.body },
+          contentCheckOk: true,
+          racyCheckOk: true
+        })
+      },
+      4000
+    );
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    if (json?.playabilityStatus?.status && json.playabilityStatus.status !== 'OK') return null;
+    if (!json?.streamingData) return null;
+    return json.streamingData;
+  };
+
+  const results = await Promise.allSettled(YT_CLIENTS.map(attempt));
+
+  for (const result of results) {
+    if (result.status === 'fulfilled' && result.value) {
+      ytResolveCache.set(videoId, {
+        streamingData: result.value,
+        expiresAt: Date.now() + YT_CACHE_TTL_MS
+      });
+      if (ytResolveCache.size > 200) {
+        const oldest = ytResolveCache.keys().next().value;
+        ytResolveCache.delete(oldest);
+      }
+      return result.value;
     }
   }
   return null;
@@ -190,7 +211,7 @@ function pickYouTubeFormat(streamingData, mode, quality) {
 
   const desired = parseInt(String(quality).replace(/\D/g, ''), 10) || 720;
 
-  // Progressive first: single file with picture + sound, ideal for the proxy
+  // Progressive first: one file carrying picture and sound, ideal for the proxy
   const progressive = formats.filter((f) => withUrl(f) && mimeOf(f).includes('video/mp4'));
   if (progressive.length) {
     const sorted = [...progressive].sort((a, b) => Number(b.height || 0) - Number(a.height || 0));
@@ -203,7 +224,7 @@ function pickYouTubeFormat(streamingData, mode, quality) {
 
   if (hls) return { url: hls, mime: 'application/x-mpegURL' };
 
-  // Adaptive video-only (client muxes audio separately)
+  // Adaptive video-only (the client muxes audio separately)
   const video = adaptive.filter((f) => withUrl(f) && mimeOf(f).startsWith('video/mp4'));
   if (video.length) {
     const capped = video.filter((f) => Number(f.height || 0) > 0 && Number(f.height || 0) <= desired);
@@ -226,7 +247,6 @@ async function resolveYouTube(targetUrl, mode, quality) {
     if (picked) return picked;
   }
 
-  // Fallback: ytdl-core
   try {
     const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
     const picked = pickYouTubeFormat(info.streamingData, mode, quality);
@@ -248,7 +268,6 @@ function parseDurationText(text) {
 async function searchYouTube(query, limit = 20, musicOnly = false) {
   const client = musicOnly
     ? {
-        name: 'WEB_REMIX',
         ua: YT_CLIENTS[4].ua,
         cn: '67',
         cv: '1.20241009.01.00',
@@ -941,6 +960,7 @@ module.exports = async (req, res) => {
         8000
       );
 
+      // Block infinite live radio streams from hanging downloads
       if (upstream.headers.get('icy-metaint') || upstream.headers.get('icy-name')) {
         return res.status(400).json({ error: 'Live radio streams cannot be downloaded offline.' });
       }
